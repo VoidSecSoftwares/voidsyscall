@@ -25,6 +25,12 @@ func SetGSBase(newbase uintptr)
 //go:noescape
 func ReadGSBase() uintptr
 
+//go:noescape
+func asm_cpuid(leaf uintptr, a *uintptr, b *uintptr, c *uintptr, d *uintptr)
+
+//go:noescape
+func asm_rdtsc(lo *uint32, hi *uint32)
+
 // GetCurrentProcessId reads the PID from the PEB (PEB+0x40, GS[0x60] -> PEB).
 func GetCurrentProcessId() (uint32, error) {
 	tebBase := ReadGSBase()
