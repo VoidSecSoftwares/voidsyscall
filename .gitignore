@@ -1,0 +1,25 @@
+# Binaries
+build/
+*.exe
+*.exe.manifest
+*.linux
+*.darwin
+*.so
+*.dll
+*.dylib
+
+# Test binaries
+*.test
+*.out
+
+# Certificates / keys (never commit)
+*.pem
+*.key
+
+# Go
+vendor/
+
+# Editor
+.vscode/
+.idea/
+*.swp
