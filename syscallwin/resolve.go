@@ -202,6 +202,10 @@ func InitNtdll() error {
 	ntdllSize = uintptr(imageSize)
 
 	ssnCache = make(map[uint32]uint16, 2048)
+
+	// Best-effort: keep a disk copy handy so DetectNtdllHooks can diff
+	// against a clean image without depending on tool-supplied files.
+	_ = loadNtdllDiskCopy()
 	return nil
 }
 

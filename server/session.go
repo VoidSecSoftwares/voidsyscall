@@ -16,6 +16,7 @@ type Session struct {
 	Channel   string
 	Info      map[string]string
 	taskTimes map[[16]byte]time.Time
+	Schedules []*Schedule
 }
 
 type Task struct {
@@ -28,6 +29,16 @@ type Result struct {
 	TaskID [16]byte
 	Status uint8
 	Output []byte
+}
+
+// Schedule is a server-side recurring task. On every beacon pass the session
+// queue is refilled from due schedules, so the operator gets persistence
+// without touching the agent's loop.
+type Schedule struct {
+	Type     uint8
+	Data     []byte
+	Interval time.Duration
+	NextRun  time.Time
 }
 
 type SessionManager struct {
@@ -114,6 +125,73 @@ func (s *Session) GetResults() []*Result {
 	results := s.Results
 	s.Results = nil
 	return results
+}
+
+// PeekResults returns a copy of the stored results without draining them.
+func (s *Session) PeekResults() []*Result {
+	s.ResultsMu.Lock()
+	defer s.ResultsMu.Unlock()
+	results := make([]*Result, len(s.Results))
+	for i, r := range s.Results {
+		cp := *r
+		cp.Output = append([]byte(nil), r.Output...)
+		results[i] = &cp
+	}
+	return results
+}
+
+// PeekQueue returns a copy of the queued tasks without dequeuing them.
+func (s *Session) PeekQueue() []*Task {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	tasks := make([]*Task, len(s.Queue))
+	for i, t := range s.Queue {
+		cp := *t
+		cp.Data = append([]byte(nil), t.Data...)
+		tasks[i] = &cp
+	}
+	return tasks
+}
+
+func (s *Session) AddSchedule(taskType uint8, data []byte, interval time.Duration) {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	s.Schedules = append(s.Schedules, &Schedule{
+		Type:     taskType,
+		Data:     append([]byte(nil), data...),
+		Interval: interval,
+		NextRun:  time.Now().Add(interval),
+	})
+}
+
+func (s *Session) DueSchedules(now time.Time) []*Task {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	var due []*Task
+	for _, sch := range s.Schedules {
+		if now.After(sch.NextRun) {
+			t := &Task{Type: sch.Type, Data: append([]byte(nil), sch.Data...)}
+			due = append(due, t)
+			sch.NextRun = now.Add(sch.Interval)
+		}
+	}
+	return due
+}
+
+func (s *Session) ShowSchedules() []Schedule {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	out := make([]Schedule, len(s.Schedules))
+	for i, sch := range s.Schedules {
+		out[i] = *sch
+	}
+	return out
+}
+
+func (s *Session) ClearSchedules() {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	s.Schedules = nil
 }
 
 func (s *Session) RecordTask(id [16]byte) {

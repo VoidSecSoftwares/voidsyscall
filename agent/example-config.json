@@ -1,11 +1,14 @@
 {
   "id": "0102030405060708090a0b0c0d0e0f10",
   "key": "0000000000000000000000000000000000000000000000000000000000000000",
-  "channels": ["https", "dns", "icmp"],
+  "channels": ["https", "dns", "icmp", "doh"],
   "server": "127.0.0.1",
   "path": "/api/v2/health",
   "jitter_min": 5,
   "jitter_max": 30,
   "sleep": 30,
-  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "doh_url": "https://dns.google/resolve",
+  "doh_domain": "voidsec.local",
+  "unhook_every": 10
 }

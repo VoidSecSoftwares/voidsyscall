@@ -7,15 +7,18 @@ import (
 )
 
 type Config struct {
-	AgentID    []byte   `json:"id"`
-	Key        []byte   `json:"key"`
-	Channels   []string `json:"channels"`
-	ServerAddr string   `json:"server"`
-	BeaconPath string   `json:"path"`
-	JitterMin  int      `json:"jitter_min"`
-	JitterMax  int      `json:"jitter_max"`
-	Sleep      int      `json:"sleep"`
-	UserAgent  string   `json:"ua"`
+	AgentID     []byte   `json:"id"`
+	Key         []byte   `json:"key"`
+	Channels    []string `json:"channels"`
+	ServerAddr  string   `json:"server"`
+	BeaconPath  string   `json:"path"`
+	JitterMin   int      `json:"jitter_min"`
+	JitterMax   int      `json:"jitter_max"`
+	Sleep       int      `json:"sleep"`
+	UserAgent   string   `json:"ua"`
+	DoHURL      string   `json:"doh_url"`
+	DoHDomain   string   `json:"doh_domain"`
+	UnhookEvery int      `json:"unhook_every"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -44,6 +47,15 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Sleep == 0 {
 		cfg.Sleep = 30
+	}
+	if cfg.DoHURL == "" {
+		cfg.DoHURL = "https://dns.google/resolve"
+	}
+	if cfg.DoHDomain == "" {
+		cfg.DoHDomain = "voidsec.local"
+	}
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 	}
 	return cfg, nil
 }

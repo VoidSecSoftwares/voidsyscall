@@ -8,6 +8,7 @@ const (
 	ChannelHTTPS ChannelType = "https"
 	ChannelDNS   ChannelType = "dns"
 	ChannelICMP  ChannelType = "icmp"
+	ChannelDoH   ChannelType = "doh"
 )
 
 type Message struct {
@@ -31,6 +32,8 @@ func New(typ ChannelType, config *Config) (Channel, error) {
 		return newDNSChannel(config)
 	case ChannelICMP:
 		return newICMPChannel(config)
+	case ChannelDoH:
+		return newDOHChannel(config)
 	default:
 		return nil, ErrUnsupportedChannel
 	}

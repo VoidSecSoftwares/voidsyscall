@@ -15,6 +15,9 @@ type Config struct {
 	DNSPort     int
 	ICMPAddr    string
 	ICMPPort    int
+	DoHURL      string
+	DoHDomain   string
+	DoHAddr     string
 	UserAgent   string
 	BeaconPath  string
 	JitterMax   int // percent
@@ -33,6 +36,9 @@ func DefaultConfig() *Config {
 		DNSPort:    53,
 		ICMPAddr:   "0.0.0.0",
 		ICMPPort:   0,
+		DoHURL:     "https://dns.google/resolve",
+		DoHDomain:  "voidsec.local",
+		DoHAddr:    "0.0.0.0",
 		UserAgent:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 		BeaconPath: "/api/v2/health",
 		JitterMax:  30,
