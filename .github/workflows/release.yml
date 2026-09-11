@@ -32,8 +32,10 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
+
+        # For workflow_dispatch the default branch (with the Dockerfile) is
+        # checked out; for tag/release events the tag commit is used. All
+        # tags created from now on already carry the container definitions.
 
       - name: Set up Go
         uses: actions/setup-go@v5
