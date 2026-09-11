@@ -108,6 +108,7 @@ func TestStateRoundTrip(t *testing.T) {
 	sess := srv.sessions.GetOrCreate(id, []byte("symmetric-key-32-bytes!"), "doh")
 	sess.Info["ua"] = "curl/8"
 	sess.EnqueueTask(&Task{ID: makeTaskID(), Type: uint8(TaskShell), Data: []byte("ipconfig")})
+	sess.RecordTask(makeTaskID())
 	sess.AddResult(&Result{TaskID: makeTaskID(), Status: 0, Output: []byte("ok")})
 	sess.Schedules = append(sess.Schedules, &Schedule{
 		Type: uint8(TaskProcs), Interval: 60 * time.Second, NextRun: time.Now().Add(time.Minute),
@@ -137,6 +138,9 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 	if len(got.Results) != 1 || got.Results[0].Status != 0 {
 		t.Fatal("results mismatch after restore")
+	}
+	if len(got.taskTimes) != 1 {
+		t.Fatalf("taskTimes mismatch after restore: %d", len(got.taskTimes))
 	}
 	if len(got.Schedules) != 1 {
 		t.Fatal("schedules mismatch after restore")

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,7 +19,7 @@ type persistedSession struct {
 	Channel    string
 	Info       map[string]string
 	Schedules  []*Schedule
-	TaskTimes  map[[16]byte]time.Time
+	TaskTimes  map[string]time.Time
 }
 
 type persistedState struct {
@@ -41,9 +42,9 @@ func (s *Server) SaveState(path string) error {
 		sess.QueueMu.Lock()
 		queue := append([]*Task(nil), sess.Queue...)
 		schedules := append([]*Schedule(nil), sess.Schedules...)
-		taskTimes := make(map[[16]byte]time.Time, len(sess.taskTimes))
+		taskTimes := make(map[string]time.Time, len(sess.taskTimes))
 		for k, v := range sess.taskTimes {
-			taskTimes[k] = v
+			taskTimes[hex.EncodeToString(k[:])] = v
 		}
 		sess.QueueMu.Unlock()
 
@@ -103,10 +104,15 @@ func (s *Server) LoadState(path string) error {
 		if sess.Info == nil {
 			sess.Info = make(map[string]string)
 		}
-		if ps.TaskTimes != nil {
-			sess.taskTimes = ps.TaskTimes
-		} else {
-			sess.taskTimes = make(map[[16]byte]time.Time)
+		sess.taskTimes = make(map[[16]byte]time.Time, len(ps.TaskTimes))
+		for k, v := range ps.TaskTimes {
+			kb, err := hex.DecodeString(k)
+			if err != nil || len(kb) != 16 {
+				continue
+			}
+			var id [16]byte
+			copy(id[:], kb)
+			sess.taskTimes[id] = v
 		}
 		s.sessions.sessions[sess.ID] = sess
 	}
