@@ -6,107 +6,188 @@
 [![c2](https://img.shields.io/badge/c2-https%20%7C%20dns%20%7C%20icmp-blueviolet)](channels/)
 [![syscalls](https://img.shields.io/badge/implant-syscall%20only-critical?logo=intel)](syscallwin/)
 
-[English](./README.md) | **简体中文**
+[English](./README.md) | **简体中文** | [조선어](./README_ko-KP.md) | [Русский](./README_ru-RU.md)
 
-零 WinAPI。所有 NT 原语在运行时从内存中的 ntdll 动态解析——通过 Plan9 汇编存根直接发出 `SYSCALL` 指令，不依赖导入表，不触碰 ntdll 用户态钩子。支持 HTTPS / DNS / ICMP C2 通道，每条消息使用 AES-256-GCM 加密。原生 Windows 实现，同时支持 Linux 和 macOS 构建。
+零 WinAPI。所有 NT 原语在运行时从内存映像中的 ntdll 动态解析——通过 Plan9 汇编存根直接发出 `SYSCALL` 指令，无导入表（IAT 全零），不触碰 ntdll 用户态钩子。C2 走 HTTPS / DNS / ICMP 通道，每条消息 AES-256-GCM AEAD 封装并附带独立 nonce。原生 Windows 植入逻辑，同时保留 Linux / macOS 服务端构建。
 
-这不是一个 syscall 封装库，而是一个完整的植入框架。从代码注入、文件读取到注册表持久化，所有操作均通过在启动时从当前 ntdll 导出表中解析的原始 `Nt*` syscall 完成。二进制文件中不存在任何 WinAPI 调用，用户态钩子无处着力。
+这不是 syscall 封装库，而是**完整植入框架**：从代码注入、文件 I/O、注册表持久化到令牌冒名，所有操作一律走开机时从当前 ntdll 导出表解析出的原始 `Nt*` syscall。二进制内不存在任何 `kernel32`/`advapi32`/`user32`/`win32u` 导入，用户态钩子（inline hook、IAT hook、Callbacks）无处着力。每个函数名以 djb2 哈希常量存在，反汇编结果中检索不到明文字符串——只有 32 位哈希和 `SYSCALL` 助记符。
 
 ---
 
-## 内容概览
+## 目录
 
-### Syscall 引擎
+- [Syscall 引擎（直接 / 间接 / 指纹 / Unhook）](#syscall-引擎)
+- [注入——4 种方法，多态轮换](#注入)
+- [反分析——13+ 检测方法](#反分析)
+- [Token 操作 / VAD 操作 / 文件 I/O / 注册表 / 句柄 / 内存加密 / 补丁](#token-操作)
+- [C2 通道与线格式](#c2-通道)
+- [Crypto（AES-256-GCM）](#crypto)
+- [目录结构与内部机制](#目录结构与内部机制)
+- [SSN 解析七步走](#ssn-解析七步走)
 
-- **运行时 SSN 解析**：PEB → LDR → ntdll 基址 → PE 导出表 → djb2 哈希匹配 → 前导序列扫描（`B8 xx xx 00 00 0F 05` 直接模式，或 `4C 8B D1 B8 xx xx 00 00 0F 05` Hells Gate 模式）。所有函数名在编译时哈希化，二进制文件中不含明文字符串。
-- **直接 syscall**：Plan9 汇编（`asm_amd64.s`）将 SSN 加载至 EAX，手动设置 7 个参数，执行 `SYSCALL`，通过 `RAX`/`RDX` 获取返回值。
-- **间接 syscall**：在 ntdll 中定位 `0F 05 C3` gadget（`syscall;ret`），通过该 gadget 调用。CPU 陷阱落在 ntdll 内部——调用栈显示 ntdll 帧，而非植入帧。用户态钩子形同虚设。
-- **SSN 指纹**：导出当前 ntdll 版本的所有已解析 SSN，生成指纹哈希。可导出为十六进制，在其他机器上导入。在构建不匹配导致问题之前即可检测。
-- **Unhook**：将 `.text` 段锁定为 RWX，从磁盘映射的原始 ntdll 复制原始字节，恢复内存保护，刷新指令缓存，清除 SSN 缓存。任何 EDR 放置的用户态钩子全部失效。
+---
 
-### 注入——4 种方法，多态轮换
+## Syscall 引擎
 
-Agent 自动轮换注入技术。每次调用使用不同方法——取证分析中两次注入不会呈现相同特征。
+### 运行时 SSN 解析（开机流程）
 
-| 方法 | 工作原理 | 隐蔽性 |
-|------|---------|--------|
-| **Section 映射** | `NtCreateSection` → `NtMapViewOfSection`（远程）→ `NtCreateThreadEx` | VAD 中不分配 RWX 内存。Section 由文件支撑。内存扫描器看到的是 `PAGE_EXECUTE_READ`，而非 `PAGE_EXECUTE_READWRITE`。 |
-| **进程镂空** | `NtCreateUserProcess`（挂起）→ `NtSuspendProcess` → 清零镜像基址 → 分配 + 写入 shellcode → `NtSetContextThread`（RIP = shellcode）→ `NtResumeProcess` | 在任务管理器中显示为合法的 svchost.exe。仅内存内容不同。 |
-| **APC 排队** | 通过 `NtQuerySystemInformation` 枚举线程 → `NtOpenThread` → `NtQueueApcThread` | 不创建新线程，不分配新 TEB 和新栈。在线程进入可警醒等待时触发。 |
-| **模块覆盖** | 在目标中分配内存 → 写入最小 PE 头 + shellcode → `NtCreateThreadEx` 从入口点执行 | 模块列表显示为合理的 DLL 名称。PE 头足够有效以欺骗模块枚举。 |
+```
+ReadGSBase ──GS:[0x60]──▶ TEB ──+0x60──▶ PEB ──+0x18──▶ PEB_LDR_DATA
+                                                              │
+                                          +0x10 InMemoryOrderModuleList ◀── 链表头
+                                                              │
+                      遍历节点，取 module->DllBase 上读 PE 头，djb2 匹配 ntdll" 基址
+                                                              │
+                     IMAGE_DOS_HEADER.e_lfanew ──▶ IMAGE_NT_HEADERS
+                                                              │
+                     OptionalHeader.DataDirectory[0].VirtualAddress ──▶ 导出表
+                                                              │
+          AddressOfNames[] 逐个 djb2 → 命中目标函数名 → 序号 → AddressOfFunctions[]
+                                                              │
+                              函数地址 ──▶ 前导序列扫描 ──▶ 提取 SSN
+```
 
-### 反分析——13+ 检测方法
+- **djb2 哈希**：`h = 5381; h = h*33 + c`。名称哈希在编译期完成（`hash.go` 以字符串 + UTF-16 双变体同构），二进制只有 `uint32` 常量。
+- **前导扫描**（`resolve.go`）逐字节在目标函数前 64 字节窗口内匹配以下模式并**容忍 jmp 跳板**（`EB xx` 短跳 / `E9 xx xx xx xx` 近跳 → 沿跳转链继续扫描）：
+  - 直接模式：`B8 xx xx 00 00 0F 05`（`mov eax, SSN; syscall`）
+  - 提前返回模式：`B8 xx xx 00 00 C3`（`mov eax, SSN; ret`）
+  - Hells Gate 变体：`4C 8B D1 B8 xx xx 00 00 0F 05`（`mov r10, rdx; mov eax, SSN; syscall`）
+- **SSN 提取**：取 `B8` 之后 4 字节小端，低 16 位即 SSN，存入 `map[uint32]uint16` 缓存（函数哈希 → SSN）。
+- **Win32k 命名空间**：GDI/User 原语（`NtUser*`/`NtGdi*`）走 `win32u.dll`，其 SSN 空间与 ntdll **分离**，单独解析、单独缓存。
 
-执行所有检查，返回评分威胁报告。Critical 级别时自动销毁。
+### 直接 syscall（Plan9 汇编存根）
 
-| 检测项 | 方法 |
-|--------|------|
-| **虚拟机检测** | CPUID `0x40000000` 叶节点超管理器签名扫描（VMware、VirtualBox、Hyper-V、KVM、Xen、QEMU、Parallels）+ `0x40000001` 叶节点回退 |
-| **沙箱检测** | CPU 核心数、注册表工件（VMware Tools、VBox Guest Additions、VMware/VBox 服务）、沙箱进程扫描（30+ 已知进程名：wireshark、procmon、x64dbg、ida 等） |
-| **调试器检测** | `PEB.BeingDebugged`、`PEB.NtGlobalFlag`、堆调试标志、`ProcessDebugPort`、`ProcessDebugObjectHandle`、`ProcessDebugFlags`、硬件断点 DR0-7、计时单步检测 |
-| **计时异常** | 基于 RDTSC：对 `NtQuerySystemInformation` 延迟采集 50 个样本，计算均值/标准差，若超过 10% 的样本超出 3σ 方差则标记。捕获检测工具引入的开销。 |
-| **PEB 规避** | 修补 `BeingDebugged`、`NtGlobalFlag`、`ProcessHeap` 标志、`DebugPort`、`ThreadHideFromDebugger`——全部通过 `GS` 段读取 + `NtWriteVirtualMemory` 完成。无 API 调用。 |
+`asm_amd64.s` 手写 ABI，关键语义：
 
-### Token 操作
+| 阶段 | 寄存器动作 |
+|------|-----------|
+| 参数入位 | 第 1~3 参依次送 `CX/R8/R9`（`syscallwin` 约定），第 4 参送 `R10`（**必须**，`SYSCALL` 会 clobber `RCX/R11`） |
+| SSN 注入 | `movl $ssn, AX`（AX=RAX，Plan9 为长度无前缀命名） |
+| 触发 | `SYSCALL` → 内核从 `MSR_LSTAR` 进入 `KiSystemCall64` |
+| 返回 | `NTSTATUS` 在 RAX；`NtDeviceIoControlFile` 等会把输出缓冲指针放 RDX |
 
-全部通过 `Nt*` syscall 实现，无 WinAPI。
+`Syscall`（≤7 参）与新加 `Syscall9`（9 参，栈帧 `$0-88`，`SUB $0x50` 为第 8/9 参预留）覆盖 `NtGdiBitBlt` 这类重参数量 syscall。零 Wi-Fi 调用：识别函数、系统调用、参数铺排全部在无库依赖的裸汇编里完成。
 
-- `EnablePrivilege(index)` — 按 LUID 设置任意权限
-- `EnableAllTokenPrivileges()` — 一次启用 20 个权限（Debug、Impersonate、TCB、Backup、Restore 等）
-- `GetProcessTokenIntegrityLevel()` — 查询强制完整性等级
-- `StealProcessToken(pid)` — 打开并复制另一个进程的 Token
+### 间接 syscall
+
+直接 syscall 的调用栈里始终只有**植入自身的帧**——密集 EDR 靠栈回溯即可抓现行。间接模式在 ntdll `.text` 中搜索 `0F 05 C3`（`syscall; ret`）gadget，经其落地：
+
+- CPU 陷阱地址落在 **ntdll 内部**，`KiUserExceptionDispatch`/栈回溯呈现 ntdll 帧；
+- EDR 常把 `syscall` 指令所在页标记为非执行页（`NtProtectVirtualMemory` 至 `PAGE_PRESERVE`）——扫描时跳过首个字节偏移、改用相邻 `0F 05` 双字节序列落位，进一步绕开“页颗粒”防护。
+
+### SSN 指纹（跨 Windows 构建预校验）
+
+SSN 非稳定接口：`10.0.19041`（20H1）到 `10.0.26100`（24H2）间同一函数的编号漂移频繁。`fingerprint.go` 将当次 ntdll 构建的所有已解析 SSN 排序 + 哈希，生成 64 位指纹：
+
+- **导出**：十六进制串，可与队友/第二台机器比对；
+- **导入**：在解析前比对，构建不匹配 → 直接放弃该机器上的诱导行为，避免“半编号漂移”打到错误 syscall；
+- **收益**：指纹在跑任务前就发现“这个 ntdll 我没见过”。
+
+### Unhook（磁盘镜像重灌）
+
+EDR 惯用手法：把 ntdll 的 `.text` 页做成 RWX 并注入 5~14 字节跳板（`jmp r11; push r11; mov r11, <handler>` 等）。Unhook 流程：
+
+```
+NtCreateFile(\SystemRoot\System32\ntdll.dll) → NtMapViewOfSection(SEC_IMAGE)
+  → 新版 .text 与 in-memory .text 逐字节 diff
+  → NtProtectVirtualMemory(.text → RWX) → memcpy(干净页) 
+  → 恢复保护(RX) → FlushInstructionCache → 清空 SSN 缓存
+```
+
+之后每个信标前半段无条件执行 `CheckAndUnhook()`——即便 EDR 二次挂钩，也会在下一个 beacon 前被再次抹平。
+
+---
+
+## 注入
+
+Agent 信标循环内轮换 4 种注入技术，两次注入的内存布局、落点、线程创建路径互不相同。
+
+| 方法 | 原语链 | 隐蔽性分析 |
+|------|--------|-----------|
+| **Section 映射** | `NtCreateSection` → `NtMapViewOfSection`（本地写→远程读）→ `NtCreateThreadEx`（shellcode 地址） | Section 由磁盘文件背书，VAD 中无 `PAGE_EXECUTE_READWRITE`；远程私有页仅以 `PAGE_EXECUTE_READ` 呈现，内存扫描器按保护位白名单放行 |
+| **进程镂空** | `NtCreateUserProcess`（挂起）→ `NtSuspendProcess` → 索引镜像基址 → 清零原 Base → 分配 + `NtWriteVirtualMemory`（shellcode）→ `NtSetContextThread`（RIP=载荷）→ `NtResumeProcess` | 任务管理器里是合法的 svchost.exe——路径、PID、PPID 全真，只有内存内容被替换 |
+| **APC 排队** | `NtQuerySystemInformation(SystemHandleInformation)` 枚举线程 → `NtOpenThread` → `NtQueueApcThread` | 零新线程、零新 TEB、零新栈分配；等待目标线程进入可警醒等（`WaitForSingleObject`/I/O 完成）时插入内核 APC |
+| **模块覆盖** | 目标进程内分配 → 写入最小合法 PE 头 + shellcode → `NtCreateThreadEx`（入口点） | 模块列表出现看似合理的 DLL 名；PE 头几何结构（节表、SizeOfHeaders）足矣骗过裸模块枚举 |
+
+轮换顺序由 `agent` 内部取模推进——同一植入的不同次注入在不同宿主上无稳定指纹。
+
+---
+
+## 反分析
+
+全量检查跑完后输出**评分威胁报告**；达到 Critical（OU）阈值触发自动销毁（`SelfDel` + `NtTerminateProcess`）。
+
+| 检测项 | 机制细节 |
+|--------|---------|
+| **VM 检测** | `CPUID(0x40000000)` 读 12 字节超管理器签名（`VMwareVMware`、`Microsoft Hv`、`KVMKVMKVM`、`XenVMMXenVMM`、`QEMU`、`VBoxVBoxVBox`、`prl hyperv`…）；叶节点 `0x40000001` 的厂商字符串作回退 |
+| **沙箱检测** | 逻辑处理器数量；注册表工件 `HKLM\SOFTWARE\VMware, Inc.\VMware Tools`、`VBoxGuestAdditions`、服务键检查；30+ 进程名扫描（`wireshark`、`procmon`、`x64dbg`、`idaq`、`dumpcap`、`ollydbg`…） |
+| **调试器检测** | `PEB.BeingDebugged`(0x02)、`PEB.NtGlobalFlag`(0x68, 对照 `FLG_HEAP_ENABLE_TAIL_CHECK`…) 、堆调试标志、`ProcessDebugPort`、`ProcessDebugObjectHandle`、`ProcessDebugFlags`、硬件断点 `DR0~DR7`（经 `Context` 读 `Dr0..Dr7` 且校验 `DR7` 启用位）、RDTSC 单步计时|
+| **计时异常** | 50 次 `NtQuerySystemInformation` 延迟采样，算均值 μ / 标准差 σ；>10% 样本超 μ±3σ 判为插桩开销（EDR 钩子加层的时延特征） |
+| **PEB 规避** | 全程 `GS` 段偏移直读 + `NtWriteVirtualMemory` 就地修补 `BeingDebugged`、`NtGlobalFlag`、`ProcessHeap.Flags/ForceFlags`、`DebugPort` 清 0；线程级再补 `NtSetInformationThread(ThreadHideFromDebugger=0x11)` |
+| **KUSER_SHARED_DATA 读取** | 只读 `0xFFFFF78000000000` 常量区的稳定洞（TickCountMultiplier、SystemTime/InterruptTime、NumberOfPhysicalPages 等），无非法解析风险，供 evasion 第 `0x09` 子命令上报 |
+
+---
+
+## Token 操作
+
+全 `Nt*` 实现：
+
+- `EnablePrivilege(index)` — 任意权限按 LUID/索引置位
+- `EnableAllTokenPrivileges()` — 一次 20 项（SeDebug、SeImpersonate、SeTcb、SeBackup、SeRestore…）
+- `GetProcessTokenIntegrityLevel()` — 强制完整性等级（Medium/High/System）
+- `StealProcessToken(pid)` — `NtOpenProcessToken` → `NtDuplicateToken`，冒用 SYSTEM 等身份
 - `ImpersonateThread()` / `RevertToSelf()`
 
-### VAD 操作
+## VAD 操作
 
-- `EnumVirtualMemory()` — 通过 `NtQueryVirtualMemory` 遍历所有虚拟内存区域
-- `FindWritableExecRegions()` — 查找 `PAGE_EXECUTE_READWRITE` 已提交区域
-- `HideRegion()` — 设置 `PAGE_NOACCESS` 从扫描器中隐藏内存
-- `UnhideRegion()` — 恢复原始保护
+- `EnumVirtualMemory()` — `NtQueryVirtualMemory` 全区域遍历
+- `FindWritableExecRegions()` — 定位已提交 `PAGE_EXECUTE_READWRITE` 区（自 RX→RWX 切换考点）
+- `HideRegion()` / `UnhideRegion()` — `PAGE_NOACCESS` 隐藏与恢复
 
-### 文件 I/O——全部 Nt* syscall
+## 文件 I/O / 注册表 —— 全 Nt* syscall
 
-`NtCreateFile` → `NtReadFile` / `NtWriteFile` → `NtClose`。零 `CreateFileA`、`ReadFile`、`WriteFile`、`DeleteFileW` 调用。提供 `ReadFileContents()`、`WriteFileContents()`、`DeleteFileNt()`、`FileExists()`。
+- 文件：`NtCreateFile` → `NtReadFile`/`NtWriteFile` → `NtClose`；零 `CreateFileA/ReadFile/WriteFile/DeleteFileW`。`ReadFileContents()`、`WriteFileContents()`、`DeleteFileNt()`、`FileExists()`。
+- 注册表：`NtCreateKey` → `NtSetValueKey`；`AddRunKeyPersistence()`（`CurrentImagePath()` 经 `NtQueryInformationProcess(ProcessImageFileName=27)` 取自身路径后自引）与 `RemoveRunKeyPersistence()`；零 Advapi32。
+- 监控句柄：`EnumerateSystemHandles()`、`FindEDRHandles()`（PID × 30+ 名单）、`CloseEDRHandles()`、`IsProcessMonitored()`。
 
-### 注册表持久化——全部 Nt* syscall
+## 内存加密
 
-`NtCreateKey` → `NtSetValueKey`。`AddRunKeyPersistence()`、`RemoveRunKeyPersistence()`。
-无 `RegCreateKeyEx`、`RegSetValueEx` 或任何 Advapi32 调用。
+- **Vault**：内存段 XOR 流加密，定时自动换钥（解密→生成新钥→重加密）；两次换钥之间的堆转储拿到的是密文垃圾。
+- **SecureDelete**：3+1 遍覆写（随机→0→1→0）后 `NtFreeVirtualMemory`。
+- **StackEncrypt**：返回前加密栈上敏感缓冲，栈帧复用让取证失去可信度。
 
-### 句柄操作
+## 补丁
 
-- `EnumerateSystemHandles()` — 通过 `NtQuerySystemInformation(SystemHandleInformation)` 枚举系统所有打开的句柄
-- `FindEDRHandles()` — 将所有者 PID 与 30+ 已知 EDR 进程名匹配（MsSense、CrowdStrike、Sentinel、Cylance、Carbon Black 等）
-- `CloseEDRHandles()` — 关闭 EDR 在进程中放置的监控句柄
-- `IsProcessMonitored()` — 布尔检查：是否正在被监控？
+`PatchAMSI()`（`AmsiScanBuffer`→`xor eax,eax; ret`）、`PatchETW()`（`EtwEventWrite`→`ret`）、`PatchNtTraceEvent()`、`PatchDbgUiRemoteBreakin()`、`PatchInstrumentationCallbacks()`（线程躲藏）。
 
-### 内存加密
+---
 
-- **Vault**：内存中的 XOR 密码，定时自动重新密钥化。明文从不以原始形式存储。重新密钥时先解密 → 生成新密钥 → 重新加密。密钥轮换间隔内的取证堆转储获取的是垃圾数据。
-- **SecureDelete**：3 次覆写擦除（随机 → 全零 → 全一 → 全零），然后 `NtFreeVirtualMemory`。
-- **StackEncrypt**：在函数返回前加密栈分配的缓冲区。栈帧复用使取证分析不可靠。
-
-### AMSI / ETW / 规避补丁
-
-- `PatchAMSI()` — `AmsiScanBuffer` → `MOV EAX, 0; RET`
-- `PatchETW()` — `EtwEventWrite` → `RET`
-- `PatchNtTraceEvent()` — `NtTraceEvent` → `RET`
-- `PatchDbgUiRemoteBreakin()` — 线程 breakin → `RET`
-- `PatchInstrumentationCallbacks()` — `ThreadHideFromDebugger`
-
-### C2 通道
+## C2 通道
 
 | 通道 | 线格式 | 前置条件 |
 |------|--------|---------|
-| **HTTPS** | 二进制 POST，自定义帧格式，随机化 UA/路径 | TLS 证书 |
-| **DNS** | `<idx>-<total>-<base32>` 子域名，TXT 响应 | DNS 解析 |
-| **ICMPv4** | 回显请求/回复中的 ID+seq 承载负载 | 原始套接字（需 root/Admin） |
+| **HTTPS** | 二进制 POST，自定义帧头：`16B 会话ID + 1B type + N bytes payload`；UA/路径随机化 | TLS 证书（`-web-addr` 起管理 Web UI） |
+| **DNS** | `<idx>-<total>-<base32>` 子域名分片，TXT RR 回包 | 权威 NS / 递归解析 |
+| **ICMPv4** | 载荷散入 echo 请求/回复的 ID+seq 字段 | 原始套接字（root/Admin）：`ICMP_ECHO` 类型识别 |
 
-所有通道实现 `Channel` 接口。添加 NTP、DoH 或 TURN 通道只需实现该接口——Agent 零修改。
+全部实现 `Channel` 接口：新增 NTP / DoH / TURN 只需实现接口，agent 零改动。信标循环在每次 beacon 前**轮换传输通道**（round-robin）。
 
-### 加密
+**帧格式**（`channels/`）：
 
-每条消息 AES-256-GCM AEAD 加密。每条消息使用唯一 12 字节 nonce。每植入实例独立密钥环。支持基于密码短语的密钥派生。3 个测试全部通过。
+```
+┌──────────────────────────┬────────┬───────────────┬───────────┐
+│  Message.ID [16]byte     │ Type   │  Data[]       │ (len)     │
+│  —— 会话加密上下文密钥 ID   │ 1B 任务 │ 任务载荷        │ 由上层推导 │
+└──────────────────────────┴────────┴───────────────┴───────────┘
+```
+
+DoH 变体将裸帧再包一层 base32 label 分段，经 `encodeDoHLabel/decodeDoHLabel` 双向一致，单 label 最长 63B、以 `.` 拼接。
+
+---
+
+## Crypto
+
+AES-256-GCM per-message AEAD：每条消息独立 12B nonce（`NtGetTickCount` 熵混合），每植入独立 keyring，密文 + tag 后封装于信封。支持口令推导变体。单测覆盖加解密往返。
 
 ---
 
@@ -114,31 +195,34 @@ Agent 自动轮换注入技术。每次调用使用不同方法——取证分�
 
 ```
 voidsyscall/
-  syscallwin/          直接/间接 NT syscall + 规避技术
-    asm_amd64.s        Syscall/IndirectSyscall/ReadGSBase/SetGSBase/asm_cpuid/asm_rdtsc
-    resolve.go         PEB→LDR→ntdll 遍历，PE 导出解析，SSN 缓存，前导序列扫描
-    stubs.go           ~25 个 Nt* 封装，DirectSyscall，IndirectSyscallByHash
-    hash.go            djb2 哈希（字符串 + UTF-16 指针）
-    constants.go       MEM_*, PAGE_*, THREAD_*, TOKEN_*, OBJ_*, REG_*, FILE_*, STATUS_*
-    unhook.go          UnhookNtdll，SelfDel
-    peb.go             PEB 修补（BeingDebugged、NtGlobalFlag、Heap、DebugPort）
-    token.go           权限提升，Token 窃取，身份模拟
-    vad.go             VAD 枚举，隐藏/恢复区域
-    files.go           通过 Nt* syscall 进行文件 I/O
-    registry.go        通过 Nt* syscall 实现注册表持久化
-    fingerprint.go     SSN 导出，构建指纹，十六进制导出/导入
-    inject_advanced.go 4 种注入方法：Section 映射、进程镂空、APC、模块覆盖
-    antianalysis.go    虚拟机/沙箱/调试器/计时检测，评分威胁报告
-    handles.go         系统句柄枚举，EDR 句柄清除
-    memcrypt.go        Vault（重密钥 XOR）、SecureDelete、StackEncrypt、WipeMemory
-  syscallnix/          Linux/darwin 原始 syscall
-  patches/             AMSI、ETW、NtTraceEvent、DbgUiRemoteBreakin、InstrumentationCallbacks
-  channels/            HTTP、DNS（TXT）、ICMP — Channel 接口
-  crypto/              AES-256-GCM，信封封装，密码短语变体（3 个测试）
-  server/              SessionManager，任务队列，交互式 REPL
-  agent/               配置，信标循环，10 个任务处理器
-  cmd/server/main.go   带 REPL 的 CLI
-  cmd/agent/main.go    仅 Windows 入口
+  syscallwin/             直接/间接 syscall + 规避原语
+    asm_amd64.s           Syscall/IndirectSyscall/ReadGSBase/SetGSBase/asm_cpuid/asm_rdtsc
+    syscall9.a            Syscall9（9 参版，帧 $0-88）
+    resolve.go            PEB→LDR→ntdll→导出表→前导扫描，SSN 缓存，jmp 容忍
+    win32u.go             win32u SSN 解析 + Screenshot(BMP)/IsKeyDown/ClipboardText
+    kshared.go            KUSER_SHARED_DATA 只读读取
+    stubs.go              ~25 Nt* 封装 + DirectSyscall + IndirectSyscallByHash
+    hash.go               djb2（字符串 + UTF-16）
+    constants.go          MEM_*/PAGE_*/THREAD_*/TOKEN_*/OBJ_*/REG_*/FILE_*/STATUS_*
+    unhook.go             UnhookNtdll、SelfDel
+    peb.go                PEB 修补
+    token.go              权限提升、token 窃取、冒名
+    vad.go                VAD 枚举、hide/unhide
+    files.go              Nt* 文件 I/O
+    registry.go           Nt* 注册表 + RunKey 持久化
+    fingerprint.go        SSN 指纹
+    inject_advanced.go    section 映射/镂空/APC/模块覆盖
+    antianalysis.go       VM/沙箱/调试/计时检测 + 评分报告
+    handles.go            句柄枚举、EDR 句柄清除
+    memcrypt.go           Vault/SecureDelete/StackEncrypt
+  syscallnix/             Linux/darwin 原始 syscall
+  patches/                AMSI/ETW/NtTraceEvent/DbgUiRemoteBreakin/InstrumentationCallbacks
+  channels/               HTTP/DNS(TXT)/ICMP + httpcommon.go（HTTP/DoH mux 共构）
+  crypto/                 AES-256-GCM + 信封 + 口令变体（3 测试通过）
+  server/                 SessionManager、任务队列、REPL、web.go（stdlib web UI）、state.go（JSON 持久化）
+  agent/                  配置、信标循环、通道轮换、14 任务处理器
+  cmd/server/main.go      带 REPL 的 CLI（-web-addr/-state）
+  cmd/agent/main.go       仅 Windows 入口
 ```
 
 ---
@@ -146,29 +230,32 @@ voidsyscall/
 ## 构建
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-agent.exe   ./cmd/agent
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o voidsyscall-server.exe  ./cmd/server
-GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o server-linux            ./cmd/server
-GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o server-darwin           ./cmd/server
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X 'main.version=v1.1.0'" -o voidsyscall-agent.exe  ./cmd/agent
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X 'main.version=v1.1.0'" -o voidsyscall-server.exe ./cmd/server
+GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o server-linux          ./cmd/server
+GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o server-darwin         ./cmd/server
 ```
 
-使用 [garble](https://github.com/burrowers/garble) 进行混淆：
+`-X main.version` 注入编译期版本字符串，release 流程按 tag 自动写入。混淆（garble）：
 
 ```bash
-GOOS=windows GOARCH=amd64 garble -literals -tiny build -ldflags="-s -w" \
-    -o voidsyscall-agent.exe ./cmd/agent
+GOOS=windows GOARCH=amd64 garble -literals -tiny build -ldflags="-s -w" -o voidsyscall-agent.exe ./cmd/agent
 ```
 
 ---
 
-## 使用方法
+## 使用
 
 ### 服务端
 
 ```bash
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-./voidsyscall-server.exe --cert cert.pem --key key.pem --https-port 443
+./voidsyscall-server.exe --cert cert.pem --key key.pem --https-port 443 \
+    --web-addr 0.0.0.0:8181 --state session_state.json
 ```
+
+- `--web-addr`：stdlib 只读 Web UI（`/api/sessions`、`/api/sessions/{id}`，5s 自动刷新）。
+- `--state`：JSON 会话持久化，重启自动恢复队列/结果/调度。
 
 ### Agent
 
@@ -181,55 +268,42 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 | 任务 | 字节 | 载荷 |
 |------|------|------|
 | shell | `0x01` | UTF-8 命令 |
-| inject | `0x02` | PID（4 字节 LE）+ shellcode |
-| patch | `0x03` | 0x01=AMSI，0x02=ETW，0x03=两者 |
-| sleep | `0x04` | 秒数（4 字节 LE） |
-| evasion | `0x10` | 0x01=完整，0x02=虚拟机，0x03=沙箱，0x04=调试器，0x05=计时，0x06=报告 |
-| handles | `0x11` | 0x01=计数，0x02=枚举 EDR，0x03=关闭 EDR，0x04=是否被监控？ |
+| inject | `0x02` | PID（4B LE）+ shellcode |
+| patch | `0x03` | 0x01=AMSI 0x02=ETW 0x03=both |
+| sleep | `0x04` | 秒（4B LE） |
+| evasion | `0x10` | 0x01=full 0x02=VM 0x03=sandbox 0x04=debug 0x05=timing 0x06=report 0x09=KUSER |
+| handles | `0x11` | 0x01=count 0x02=enum EDR 0x03=close EDR 0x04=monitored? |
 | vault | `0x12` | 加密存储操作 |
-| fingerprint | `0x13` | 导出 SSN 构建指纹 |
-| token | `0x14` | 0x01=启用全部权限，0x02=完整性等级，0x03=调试权限，0x04=身份模拟 |
+| fingerprint | `0x13` | dump SSN 指纹 |
+| token | `0x14` | 0x01=all 0x02=integrity 0x03=debug priv 0x04=impersonate |
+| persist | `0x17` | RunKey 持久化（`[name]` 可选） |
+| screenshot | `0x18` | BMP 截图（NtGdiBitBlt → NtGdiGetBitmapBits），落 `screenshots/` |
+| keylog | `0x19` | sub：0x01=start 0x02=stop 0x03=dump（30ms 轮询，256KiB 上限） |
+| clipboard | `0x1A` | `NtUserOpenClipboard/GetClipboardData(CF_UNICODETEXT)/CloseClipboard` |
 | exit | `0xFF` | — |
 
 ---
 
-## SSN 解析内部机制
+## SSN 解析七步走
 
-1. `ReadGSBase`（汇编）→ `GS:[0x60]` → **TEB**
-2. TEB+0x60 → **PEB**。PEB+0x18 → `Ldr`
-3. 遍历 `InMemoryOrderModuleList` → 通过 djb2 哈希匹配 `ntdll.dll`
-4. 基址 → `IMAGE_DOS_HEADER` → `e_lfanew` → `IMAGE_NT_HEADERS` → DataDirectory[0] = **导出表**
-5. 遍历 `AddressOfNames[]`，逐项 djb2 哈希，匹配目标
-6. 解析序号 → `AddressOfFunctions[序号]` → 函数地址
-7. 扫描前导序列：`B8 xx xx 00 00 0F 05`（直接）、`B8 xx xx 00 00 C3`（提前返回）、`4C 8B D1 B8 xx xx 00 00 0F 05`（Hells Gate）
-8. 提取 2 字节 SSN → 存入 `map[uint32]uint16` 缓存
+1. `ReadGSBase`（asm）→ `GS:[0x60]` → TEB
+2. TEB+0x60 → PEB；PEB+0x18 → `Ldr`
+3. 遍历 `InMemoryOrderModuleList` → 节点内 16B 偏移 `DllBase`，`djb2("ntdll")` 匹配
+4. `DllBase → e_lfanew → IMAGE_NT_HEADERS → DataDirectory[0]` = 导出表
+5. `AddressOfNames[]` 逐项 djb2 对哈希
+6. 序号 → `AddressOfFunctions[]` → 函数地址
+7. 前导扫描提取 SSN；`win32u` 命名空间重复 1~7 步（基址取 `LoadLibrary("win32u.dll")` → 移除 IAT 痕迹）
 
-二进制文件中无函数名，仅有 djb2 哈希。`syscall` 指令绕过所有用户态钩子。
-
----
-
-## Agent 任务处理器
-
-```go
-TaskShell       // 通过 cmd.exe 执行
-TaskInject      // 多态：section/hollow/APC/stomp
-TaskPatch       // AMSI/ETW/两者
-TaskEvasion     // PEB 修补 + 虚拟机/沙箱/调试器/计时检测
-TaskHandles     // 枚举 + 清除 EDR 监控句柄
-TaskFingerprint // 导出 SSN 构建指纹
-TaskToken       // 权限提升 + 身份模拟
-TaskVault       // 加密内存存储
-TaskSleep       // 感知抖动的睡眠
-TaskExit        // 干净退出
-```
+二进制无函数名字符串，只有 djb2 常量。`syscall` 指令在除数保护环切换——用户态钩子永远不可达。
 
 ---
 
 ## 状态
 
-**已完成**：信标循环、任务队列、3 个 C2 通道、4 种注入方法、10+ 反检测检查、句柄枚举/关闭、Token 操作、VAD 操作、文件 I/O、注册表持久化、SSN 指纹、内存加密、AMSI/ETW 修补、AES-GCM 加密、会话管理、交互式 REPL。3 个加密测试通过。`go build` 在 Windows 上编译通过。
+**已交付**：信标循环、任务队列、3 C2 通道 + DoH 变体、4 注入方法、13+ 反检测、句柄枚举/清除、token 全套、VAD、Nt* 文件 I/O、RunKey 持久化、SSN 指纹、内存加密、AMSI/ETW 补丁、AES-GCM、无钩子 PEB 规避、web UI、JSON 状态持久化、可注入版本、CI 流水线、通道轮换。
+**工程化**：`go build ./...` 干净；`go vet ./cmd/... ./server/... ./channels/... ./crypto/...` 通过；单元测试覆盖 channels（帧往返/DoH label）、server（会话/调度/状态往返）、agent（任务分发/keylog 映射）。
 
-**待完成**：Linux 自主 Agent（构建已存在，无 Agent 逻辑）、会话密钥轮换、分阶段加载器、NTP/DoH 通道、持久化调度。
+**待完成**：Linux 自主 agent（仅构建）、会话密钥轮换、分阶段 loader、NTP/TURN 通道、持久化调度。
 
 ## 致谢
 
