@@ -1,0 +1,72 @@
+name: Release & Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag to build and publish (e.g. v1.0.0)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/voidsyscall-server.exe ./cmd/server
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/voidsyscall-agent.exe ./cmd/agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/voidsyscall-server-linux-amd64 ./cmd/server
+          cp agent/example-config.json dist/voidsyscall-agent-config.example.json
+
+      - name: Package zip + checksums
+        run: |
+          cd dist
+          python3 -m zipfile -c "../voidsyscall-${{ steps.tag.outputs.tag }}-windows.zip" *  >/dev/null
+          sha256sum * ../voidsyscall-${{ steps.tag.outputs.tag }}-windows.zip | sed "s|\.\./||" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          gh release upload "${{ steps.tag.outputs.tag }}" * ../voidsyscall-${{ steps.tag.outputs.tag }}-windows.zip --clobber
+
+      - name: Build and push image (GHCR)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMG="ghcr.io/${{ github.repository_owner }}/voidsyscall-server"
+          docker build -t "$IMG:${{ steps.tag.outputs.tag }}" -t "$IMG:latest" .
+          docker push "$IMG:${{ steps.tag.outputs.tag }}"
+          docker push "$IMG:latest"
