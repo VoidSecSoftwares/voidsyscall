@@ -25,6 +25,34 @@ TEXT ·Syscall(SB), NOSPLIT, $0-80
 	MOVQ DX, ret2+72(FP)
 	RET
 
+// func Syscall9(funcId uint32, arg1..arg9 uintptr) (uintptr, uintptr)
+// 9-argument variant for win32k-backed functions (NtGdiBitBlt etc).
+// Kernel reads arg5+ from [RSP+0x28..] at SYSCALL time, so the stack frame
+// must reserve the five spill slots below the call-site RSP.
+TEXT ·Syscall9(SB), NOSPLIT, $0-88
+	MOVL funcId+0(FP), AX
+	MOVQ arg1+8(FP), CX
+	MOVQ arg2+16(FP), DX
+	MOVQ arg3+24(FP), R8
+	MOVQ arg4+32(FP), R9
+	SUBQ $0x50, SP
+	MOVQ arg5+40(FP), BX
+	MOVQ BX, 0x28(SP)
+	MOVQ arg6+48(FP), BX
+	MOVQ BX, 0x30(SP)
+	MOVQ arg7+56(FP), BX
+	MOVQ BX, 0x38(SP)
+	MOVQ arg8+64(FP), BX
+	MOVQ BX, 0x40(SP)
+	MOVQ arg9+72(FP), BX
+	MOVQ BX, 0x48(SP)
+	MOVQ CX, R10
+	SYSCALL
+	ADDQ $0x50, SP
+	MOVQ AX, ret1+80(FP)
+	MOVQ DX, ret2+88(FP)
+	RET
+
 // func IndirectSyscall(stubAddr uintptr, funcId uint32, arg1, arg2, arg3, arg4, arg5, arg6 uintptr) (uintptr, uintptr)
 // Jumps to a syscall;ret gadget inside ntdll. R10 = gadget address, EAX = SSN.
 TEXT ·IndirectSyscall(SB), NOSPLIT, $0-80

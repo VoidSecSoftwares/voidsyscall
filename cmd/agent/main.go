@@ -10,6 +10,8 @@ import (
 	"github.com/VoidSecSoftwares/voidsyscall/agent"
 )
 
+var version = "dev"
+
 func main() {
 	configPath := flag.String("c", "", "Config file path")
 	flag.Parse()

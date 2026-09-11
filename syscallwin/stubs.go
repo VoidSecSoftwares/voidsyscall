@@ -11,6 +11,9 @@ import (
 func Syscall(funcId uint32, arg1, arg2, arg3, arg4, arg5, arg6, arg7 uintptr) (uintptr, uintptr)
 
 //go:noescape
+func Syscall9(funcId uint32, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9 uintptr) (uintptr, uintptr)
+
+//go:noescape
 func IndirectSyscall(stubAddr uintptr, funcId uint32, arg1, arg2, arg3, arg4, arg5, arg6 uintptr) (uintptr, uintptr)
 
 //go:noescape

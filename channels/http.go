@@ -81,106 +81,19 @@ func (h *HTTPChannel) Send(ctx context.Context, msg *Message) (*Message, error) 
 }
 
 func (h *HTTPChannel) Listen(ctx context.Context, addr string, handler func(*Message) *Message) error {
-	mux := http.NewServeMux()
-	path := h.config.BeaconPath
-	if path == "" {
-		path = "/api/v2/health"
-	}
-
-	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "read error", http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-
-		msg, err := parseMessageBuffer(body)
-		if err != nil {
-			http.Error(w, "parse error", http.StatusBadRequest)
-			return
-		}
-
-		resp := handler(msg)
-		if resp == nil {
-			http.Error(w, "no response", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		w.Write(newMessageBuffer(resp))
-	})
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Mimic normal web server behavior
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Hello World</h1></body></html>")
-	})
-
 	h.server = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: buildHTTPMux(h, handler),
 	}
-
 	_ = ctx
 	return h.server.ListenAndServeTLS("", "")
 }
 
 func (h *HTTPChannel) ListenWithTLS(ctx context.Context, addr string, certFile, keyFile string, handler func(*Message) *Message) error {
-	mux := http.NewServeMux()
-	path := h.config.BeaconPath
-	if path == "" {
-		path = "/api/v2/health"
-	}
-
-	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "read error", http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-
-		msg, err := parseMessageBuffer(body)
-		if err != nil {
-			http.Error(w, "parse error", http.StatusBadRequest)
-			return
-		}
-
-		resp := handler(msg)
-		if resp == nil {
-			http.Error(w, "no response", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		w.Write(newMessageBuffer(resp))
-	})
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Hello World</h1></body></html>")
-	})
-
 	h.server = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: buildHTTPMux(h, handler),
 	}
-
 	_ = ctx
 	return h.server.ListenAndServeTLS(certFile, keyFile)
 }

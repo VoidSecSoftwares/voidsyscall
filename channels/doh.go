@@ -2,7 +2,6 @@ package channels
 
 import (
 	"context"
-	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -57,7 +56,7 @@ func (d *DOHChannel) Send(ctx context.Context, msg *Message) (*Message, error) {
 	}
 
 	payload := newMessageBuffer(msg)
-	qname := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(payload), "="))
+	qname := encodeDoHLabel(payload)
 	fqdn := fmt.Sprintf("%s.%s", qname, domain)
 
 	client := &http.Client{Timeout: time.Duration(d.config.TimeoutSec) * time.Second}
@@ -94,7 +93,7 @@ func (d *DOHChannel) Send(ctx context.Context, msg *Message) (*Message, error) {
 			return nil, fmt.Errorf("doh: empty answer set")
 		}
 
-		decoded, err := base32.StdEncoding.DecodeString(strings.ToUpper(strings.TrimSpace(parsed.Answer[0].Data)))
+		decoded, err := decodeDoHLabel(strings.TrimSpace(parsed.Answer[0].Data))
 		if err != nil {
 			return nil, fmt.Errorf("doh: decode answer: %w", err)
 		}
@@ -105,122 +104,19 @@ func (d *DOHChannel) Send(ctx context.Context, msg *Message) (*Message, error) {
 }
 
 func (d *DOHChannel) Listen(ctx context.Context, addr string, handler func(*Message) *Message) error {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		qname := r.URL.Query().Get("name")
-		if qname == "" {
-			http.Error(w, "empty name", http.StatusBadRequest)
-			return
-		}
-		parts := strings.Split(qname, ".")
-		if len(parts) < 2 {
-			http.Error(w, "bad name", http.StatusBadRequest)
-			return
-		}
-		padded := strings.ToUpper(parts[0]) + strings.Repeat("=", (8-len(parts[0])%8)%8)
-		payload, err := base32.StdEncoding.DecodeString(padded)
-		if err != nil {
-			http.Error(w, "base32 decode", http.StatusBadRequest)
-			return
-		}
-		msg, err := parseMessageBuffer(payload)
-		if err != nil {
-			http.Error(w, "parse message", http.StatusBadRequest)
-			return
-		}
-
-		resp := handler(msg)
-		if resp == nil {
-			http.Error(w, "no response", http.StatusInternalServerError)
-			return
-		}
-		data := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(newMessageBuffer(resp)), "="))
-		w.Header().Set("Content-Type", "application/dns-json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(dohResponse{
-			Status: 0,
-			Answer: []dohAnswer{{
-				Name: qname,
-				Type: 16,
-				TTL:  60,
-				Data: data,
-			}},
-		})
-	})
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("404 page not found\n"))
-	})
-
 	d.server = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: buildDoHMux(d, handler),
 	}
-
 	_ = ctx
 	return d.server.ListenAndServe()
 }
 
 func (d *DOHChannel) ListenWithTLS(ctx context.Context, addr string, certFile, keyFile string, handler func(*Message) *Message) error {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		qname := r.URL.Query().Get("name")
-		if qname == "" {
-			http.Error(w, "empty name", http.StatusBadRequest)
-			return
-		}
-		parts := strings.Split(qname, ".")
-		if len(parts) < 2 {
-			http.Error(w, "bad name", http.StatusBadRequest)
-			return
-		}
-		padded := strings.ToUpper(parts[0]) + strings.Repeat("=", (8-len(parts[0])%8)%8)
-		payload, err := base32.StdEncoding.DecodeString(padded)
-		if err != nil {
-			http.Error(w, "base32 decode", http.StatusBadRequest)
-			return
-		}
-		msg, err := parseMessageBuffer(payload)
-		if err != nil {
-			http.Error(w, "parse message", http.StatusBadRequest)
-			return
-		}
-
-		resp := handler(msg)
-		if resp == nil {
-			http.Error(w, "no response", http.StatusInternalServerError)
-			return
-		}
-		data := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(newMessageBuffer(resp)), "="))
-		w.Header().Set("Content-Type", "application/dns-json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(dohResponse{
-			Status: 0,
-			Answer: []dohAnswer{{
-				Name: qname,
-				Type: 16,
-				TTL:  60,
-				Data: data,
-			}},
-		})
-	})
-
 	d.server = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: buildDoHMux(d, handler),
 	}
-
 	_ = ctx
 	return d.server.ListenAndServeTLS(certFile, keyFile)
 }

