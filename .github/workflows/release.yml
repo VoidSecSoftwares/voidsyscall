@@ -66,7 +66,7 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          IMG="ghcr.io/${{ github.repository_owner }}/voidsyscall-server"
+          IMG="ghcr.io/${{ lower(github.repository_owner) }}/voidsyscall-server"
           docker build -t "$IMG:${{ steps.tag.outputs.tag }}" -t "$IMG:latest" .
           docker push "$IMG:${{ steps.tag.outputs.tag }}"
           docker push "$IMG:latest"
