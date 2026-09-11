@@ -6,6 +6,8 @@
 [![c2](https://img.shields.io/badge/c2-https%20%7C%20dns%20%7C%20icmp-blueviolet)](channels/)
 [![syscalls](https://img.shields.io/badge/implant-syscall%20only-critical?logo=intel)](syscallwin/)
 
+[English](./README.md) | **简体中文**
+
 零 WinAPI。所有 NT 原语在运行时从内存中的 ntdll 动态解析——通过 Plan9 汇编存根直接发出 `SYSCALL` 指令，不依赖导入表，不触碰 ntdll 用户态钩子。支持 HTTPS / DNS / ICMP C2 通道，每条消息使用 AES-256-GCM 加密。原生 Windows 实现，同时支持 Linux 和 macOS 构建。
 
 这不是一个 syscall 封装库，而是一个完整的植入框架。从代码注入、文件读取到注册表持久化，所有操作均通过在启动时从当前 ntdll 导出表中解析的原始 `Nt*` syscall 完成。二进制文件中不存在任何 WinAPI 调用，用户态钩子无处着力。

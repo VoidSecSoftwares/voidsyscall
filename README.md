@@ -6,6 +6,8 @@
 [![c2](https://img.shields.io/badge/c2-https%20%7C%20dns%20%7C%20icmp-blueviolet)](channels/)
 [![syscalls](https://img.shields.io/badge/implant-syscall%20only-critical?logo=intel)](syscallwin/)
 
+**English** | [简体中文](./README_zh-CN.md)
+
 Zero WinAPI. Every NT primitive resolved at runtime from ntdll in memory —
 `SYSCALL` instructions issued directly via Plan9 assembly stubs, no import table,
 no ntdll usermode hooks touched. C2 over HTTPS / DNS / ICMP, AES-256-GCM per
