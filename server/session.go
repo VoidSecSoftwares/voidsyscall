@@ -15,6 +15,7 @@ type Session struct {
 	ResultsMu sync.Mutex
 	Channel   string
 	Info      map[string]string
+	taskTimes map[[16]byte]time.Time
 }
 
 type Task struct {
@@ -55,6 +56,7 @@ func (sm *SessionManager) GetOrCreate(id [16]byte, key []byte, channel string) *
 		LastBeacon: time.Now(),
 		Channel:   channel,
 		Info:      make(map[string]string),
+		taskTimes: make(map[[16]byte]time.Time),
 	}
 	sm.sessions[id] = s
 	return s
@@ -112,4 +114,24 @@ func (s *Session) GetResults() []*Result {
 	results := s.Results
 	s.Results = nil
 	return results
+}
+
+func (s *Session) RecordTask(id [16]byte) {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	if s.taskTimes == nil {
+		s.taskTimes = make(map[[16]byte]time.Time)
+	}
+	s.taskTimes[id] = time.Now()
+}
+
+func (s *Session) TaskElapsed(id [16]byte) time.Duration {
+	s.QueueMu.Lock()
+	defer s.QueueMu.Unlock()
+	t, ok := s.taskTimes[id]
+	if !ok {
+		return 0
+	}
+	delete(s.taskTimes, id)
+	return time.Since(t)
 }

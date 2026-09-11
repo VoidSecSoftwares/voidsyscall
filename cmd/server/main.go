@@ -24,6 +24,18 @@ func parseSessionID(s string) ([16]byte, bool) {
 	return id, true
 }
 
+func printHelp() {
+	fmt.Println()
+	fmt.Printf("%s%sCommands%s\n", server.AnsiBold, server.AnsiCyan, server.AnsiReset)
+	fmt.Println()
+	fmt.Printf("  %s%-24s%s%s\n", server.AnsiGreen, "sessions | ls", server.AnsiReset, "List active sessions")
+	fmt.Printf("  %s%-24s%s%s\n", server.AnsiGreen, "shell <id> <command>", server.AnsiReset, "Run a shell command on a session")
+	fmt.Printf("  %s%-24s%s%s\n", server.AnsiGreen, "patch <id> <amsi|etw|both>", server.AnsiReset, "Patch AMSI/ETW on a session")
+	fmt.Printf("  %s%-24s%s%s\n", server.AnsiGreen, "help", server.AnsiReset, "Show this help")
+	fmt.Printf("  %s%-24s%s%s\n", server.AnsiGreen, "exit | quit", server.AnsiReset, "Shut down the server")
+	fmt.Println()
+}
+
 func main() {
 	httpAddr := flag.String("http-addr", "0.0.0.0", "HTTP listen address")
 	httpPort := flag.Int("https-port", 443, "HTTPS port")
@@ -53,17 +65,17 @@ func main() {
 
 	srv := server.NewServer(cfg)
 
-	fmt.Println("╔══════════════════════════════════════════╗")
-	fmt.Println("║       voidsyscall C2 — v1.0.0            ║")
-	fmt.Println("║  VoidSec Softwares                       ║")
-	fmt.Println("║  HTTPS / DNS / ICMP                      ║")
-	fmt.Println("╚══════════════════════════════════════════╝")
+	fmt.Printf("%s%s%s\n", server.AnsiCyan, "╔══════════════════════════════════════════╗", server.AnsiReset)
+	fmt.Printf("%s%s%s\n", server.AnsiCyan, "║       voidsyscall C2 — v1.0.0            ║", server.AnsiReset)
+	fmt.Printf("%s%s%s\n", server.AnsiGreen, "║  VoidSec Softwares                       ║", server.AnsiReset)
+	fmt.Printf("%s%s%s\n", server.AnsiGreen, "║  HTTPS / DNS / ICMP                      ║", server.AnsiReset)
+	fmt.Printf("%s%s%s\n", server.AnsiCyan, "╚══════════════════════════════════════════╝", server.AnsiReset)
 	fmt.Println()
 
 	go func() {
 		for {
 			var input string
-			fmt.Print("voidsyscall> ")
+			fmt.Print(server.AnsiBold + server.AnsiCyan + "voidsyscall> " + server.AnsiReset)
 			fmt.Scanln(&input)
 			input = strings.TrimSpace(input)
 			if input == "" {
@@ -80,31 +92,33 @@ func main() {
 			switch cmd {
 			case "sessions", "ls":
 				fmt.Println(srv.ListSessions())
+			case "help":
+				printHelp()
 			case "shell":
 				parts2 := strings.SplitN(args, " ", 2)
 				if len(parts2) < 2 {
-					fmt.Println("Usage: shell <session-hex> <command>")
+					fmt.Printf("%sUsage:%s shell <session-hex> <command>\n", server.AnsiYellow, server.AnsiReset)
 					continue
 				}
 				sid, ok := parseSessionID(parts2[0])
 				if !ok {
-					fmt.Println("Invalid session hex")
+					fmt.Printf("%sInvalid session hex%s\n", server.AnsiRed, server.AnsiReset)
 					continue
 				}
 				if err := srv.RunShell(sid, parts2[1]); err != nil {
-					fmt.Printf("Error: %v\n", err)
+					fmt.Printf("%sError: %v%s\n", server.AnsiRed, err, server.AnsiReset)
 				} else {
-					fmt.Println("Task queued")
+					fmt.Printf("%sTask queued%s\n", server.AnsiGreen, server.AnsiReset)
 				}
 			case "patch":
 				parts2 := strings.SplitN(args, " ", 2)
 				if len(parts2) < 2 {
-					fmt.Println("Usage: patch <session-hex> <amsi|etw|both>")
+					fmt.Printf("%sUsage:%s patch <session-hex> <amsi|etw|both>\n", server.AnsiYellow, server.AnsiReset)
 					continue
 				}
 				sid, ok := parseSessionID(parts2[0])
 				if !ok {
-					fmt.Println("Invalid session hex")
+					fmt.Printf("%sInvalid session hex%s\n", server.AnsiRed, server.AnsiReset)
 					continue
 				}
 				var patchType byte
@@ -116,20 +130,20 @@ func main() {
 				case "both":
 					patchType = 0x03
 				default:
-					fmt.Println("Unknown patch type")
+					fmt.Printf("%sUnknown patch type%s\n", server.AnsiYellow, server.AnsiReset)
 					continue
 				}
 				if err := srv.PatchTarget(sid, patchType); err != nil {
-					fmt.Printf("Error: %v\n", err)
+					fmt.Printf("%sError: %v%s\n", server.AnsiRed, err, server.AnsiReset)
 				} else {
-					fmt.Println("Patch task queued")
+					fmt.Printf("%sPatch task queued%s\n", server.AnsiGreen, server.AnsiReset)
 				}
 			case "exit", "quit":
-				fmt.Println("Shutting down...")
+				fmt.Printf("%sShutting down...%s\n", server.AnsiYellow, server.AnsiReset)
 				os.Exit(0)
 			default:
-				fmt.Printf("Unknown command: %s\n", cmd)
-				fmt.Println("Commands: sessions, shell, patch, exit")
+				fmt.Printf("%sUnknown command: %s%s\n", server.AnsiRed, cmd, server.AnsiReset)
+				fmt.Printf("Type %shelp%s for a list of commands\n", server.AnsiCyan, server.AnsiReset)
 			}
 		}
 	}()

