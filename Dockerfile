@@ -10,7 +10,6 @@ COPY server/ server/
 COPY channels/ channels/
 COPY crypto/ crypto/
 COPY patches/ patches/
-COPY loader/ loader/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -trimpath -ldflags "-s -w" \
